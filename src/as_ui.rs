@@ -16,6 +16,8 @@ pub(super) enum Msg {
     /// (programme id, for the editor?, result)
     Info(i64, bool, Result<UploadInfo, ApiError>),
     Tested(String, Result<String, ApiError>),
+    /// A newer Studio Recorder is available in AudioShare.
+    NewVersion(String),
 }
 
 #[derive(Default)]
@@ -26,6 +28,8 @@ pub(super) struct LinkForm {
     pin: String,
     pin2: String,
     from_file: Option<String>,
+    /// The `.audioshare` file this form came from; retired after pairing.
+    file_path: Option<std::path::PathBuf>,
     busy: bool,
     error: Option<String>,
     done: Option<String>,
@@ -55,6 +59,7 @@ pub(super) struct AsUi {
     test_msg: Option<(String, bool)>,
     /// Messages for the toast line, collected during housekeeping.
     pub notices: Vec<(String, bool)>,
+    update_notified: bool,
 }
 
 impl AsUi {
@@ -73,6 +78,7 @@ impl AsUi {
             shown_confirm: HashSet::new(),
             test_msg: None,
             notices: Vec::new(),
+            update_notified: false,
         };
         // Always start logged out.
         a
@@ -137,6 +143,7 @@ impl AsUi {
         self.last_activity = Instant::now();
         self.queue.wake();
         self.refresh_programs();
+        self.check_update();
     }
 
     /// Drop a token from memory, unless its uploads are still running (§4.4).
@@ -209,12 +216,33 @@ impl AsUi {
                         }
                     }
                     f.from_file = Some(src);
+                    f.file_path = Some(p.to_path_buf());
                 }
                 Err(e) => f.error = Some(e),
             }
         }
         self.unlock = None;
         self.link = Some(f);
+    }
+
+    /// First start from the zip of AudioShare → Recorders: a personal `.audioshare`
+    /// file lies next to the program. Open the pairing form with it straight away.
+    pub fn auto_link(&mut self) {
+        if let Some(p) = api::link_files_next_to_exe().into_iter().next() {
+            self.open_link(Some(&p));
+        }
+    }
+
+    fn check_update(&self) {
+        let Some(c) = self.client() else { return };
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            if let Some(v) = c.latest_recorder() {
+                if api::newer_version(&v, env!("CARGO_PKG_VERSION")) {
+                    let _ = tx.send(Msg::NewVersion(v));
+                }
+            }
+        });
     }
 
     /// Called every frame: background results, 401s, auto-lock, dialogs.
@@ -224,6 +252,15 @@ impl AsUi {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::Claimed(r) => self.finish_claim(r),
+                Msg::NewVersion(v) => {
+                    if !self.update_notified {
+                        self.update_notified = true;
+                        self.notices.push((
+                            format!("Er is een nieuwe versie van de recorder: {v}. Download hem via AudioShare → Recorders."),
+                            false,
+                        ));
+                    }
+                }
                 Msg::Role(id, role) => {
                     if let Some(p) = self.store.get_mut(&id) {
                         if p.role != role {
@@ -372,10 +409,14 @@ impl AsUi {
 
     fn finish_claim(&mut self, r: Result<(Profile, String, Option<String>), String>) {
         let pin = self.link.as_ref().map(|f| f.pin.clone());
+        let file = self.link.as_ref().and_then(|f| f.file_path.clone());
         let res = r.and_then(|(p, token, warn)| {
             let names: Vec<String> = p.programs.iter().map(|x| x.name.clone()).collect();
             let who = p.display_name.clone();
             let id = self.store.add(p, &token, pin.as_deref())?;
+            if let Some(f) = &file {
+                api::retire_link_file(f);
+            }
             self.activate(&id, token);
             if let Some(w) = warn {
                 return Ok(format!("Gekoppeld als {who}, maar de programmalijst ophalen mislukte: {w}"));

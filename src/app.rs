@@ -1201,6 +1201,8 @@ impl App {
         app.open_selected_input();
         if let Some(p) = std::env::args().nth(1) {
             app.open_path(PathBuf::from(p));
+        } else {
+            app.aus.auto_link();
         }
         app
     }

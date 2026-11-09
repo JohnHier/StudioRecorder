@@ -239,3 +239,25 @@ fn programme_list_is_read_tolerantly() {
     assert_eq!(p[0].quality.min_duration_sec, Some(900));
     assert!(p[0].quality.samplerates.is_empty());
 }
+
+#[test]
+fn version_compare() {
+    assert!(newer_version("0.7.0", "0.6.5"));
+    assert!(newer_version("1.0.0", "0.10.9"));
+    assert!(newer_version("0.6.10", "0.6.9"));
+    assert!(!newer_version("0.6.5", "0.6.5"));
+    assert!(!newer_version("0.6.4", "0.6.5"));
+    assert!(!newer_version("", "0.6.5"));
+}
+
+#[test]
+fn link_file_is_retired() {
+    let d = std::env::temp_dir().join(format!("sr-retire-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    let p = d.join("jan.audioshare");
+    std::fs::write(&p, "{}").unwrap();
+    retire_link_file(&p);
+    assert!(!p.exists());
+    assert!(d.join("jan.audioshare.gebruikt").exists());
+    let _ = std::fs::remove_dir_all(&d);
+}

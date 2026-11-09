@@ -1,10 +1,12 @@
-# StudioRecorder 0.6.5
+# StudioRecorder 0.7.0
 
 Eenvoudige opname-app voor de radiostudio: opnemen met live waveform en VU-meter, daarna begin en eind trimmen, foutjes eruit knippen, exporteren naar FLAC, WAV of MP3 en aanleveren bij AudioShare.
 
 ## Starten
 
-`StudioRecorder.exe` is één los bestand zonder installatie. Kopieer het naar elke studio-pc en dubbelklik.
+Download de recorder in AudioShare onder **Recorders**. Je krijgt een zip met `StudioRecorder.exe` en jouw persoonlijke koppelbestand.
+Pak de zip uit in een vaste map (bijv. `C:\StudioRecorder`) en dubbelklik op de exe; het koppelscherm staat dan meteen klaar (zie *AudioShare* hieronder).
+`StudioRecorder.exe` is één los bestand zonder installatie.
 Windows SmartScreen kan de eerste keer waarschuwen ("onbekende uitgever"): kies *Meer informatie → Toch uitvoeren*.
 
 ## Opnemen
@@ -75,10 +77,17 @@ het origineel wordt nooit aangepast en de export komt in de map van het originee
 
 ## AudioShare
 
-**Koppelen** (eenmalig per maker en per pc). De beheerder maakt in AudioShare onder *Recorders* een koppelcode of koppelbestand aan.
-- Dubbelklik op het `.audioshare`-bestand, sleep het op het venster, of klik bovenin op **Koppelen met AudioShare** en vul adres en code in.
+**Koppelen** (eenmalig per maker en per pc).
+- Makkelijkst: download de recorder zelf in AudioShare → *Recorders*. Staat er bij de eerste start een `.audioshare`-bestand naast de exe,
+  dan opent de recorder meteen *Koppelen met AudioShare* met jouw gegevens ingevuld; je kiest alleen nog een pincode.
+  Na het koppelen krijgt het bestand de extensie `.gebruikt`, zodat het niet opnieuw wordt aangeboden. Een verlopen bestand wordt overgeslagen.
+- Ook mogelijk: maak in AudioShare onder *Recorders* een koppelcode of koppelbestand aan (de admin kan dat ook voor je doen).
+  Dubbelklik op het `.audioshare`-bestand, sleep het op het venster, of klik bovenin op **Koppelen met AudioShare** en vul adres en code in.
 - De recorder toont daarna bijvoorbeeld: *Gekoppeld als Jan de Vries — 2 programma's: De Blik uur 1, De Blik uur 2*.
 - De programmakeuze op het opnamescherm komt dan uit AudioShare; titel en omschrijving worden voorgesteld (paarse melding).
+
+**Nieuwe versie**: na het inloggen kijkt de recorder in AudioShare of er een nieuwere versie is (vanaf AudioShare 1.4.0) en meldt dat één keer.
+Downloaden gaat via AudioShare → *Recorders*; je koppelingen en instellingen in `%APPDATA%\StudioRecorder` blijven behouden.
 
 **Pincode**: bij het koppelen kies je een pincode (minimaal 4 cijfers) waarmee je voortaan inlogt.
 - 5 foute pincodes: 5 minuten op slot. 10 foute: opnieuw koppelen met een nieuwe code. Pincode vergeten = nieuwe koppelcode.

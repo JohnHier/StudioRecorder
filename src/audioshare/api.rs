@@ -241,6 +241,12 @@ impl Client {
         self.get("/api/v1/me")
     }
 
+    /// Newest Studio Recorder release in AudioShare (AudioShare 1.4.0+); None when unknown.
+    pub fn latest_recorder(&self) -> Option<String> {
+        let v: Value = self.get("/api/v1/me/recorder/latest").ok()?;
+        v["version"].as_str().map(str::to_string)
+    }
+
     pub fn programs(&self) -> Result<Vec<Program>, ApiError> {
         self.get::<Value>("/api/v1/me/programs").map(|v| parse_programs(&v))
     }
@@ -453,6 +459,48 @@ pub struct LinkFile {
     pub claim_code: String,
     #[serde(default)]
     pub expires: String,
+}
+
+/// True when version `a` (x.y.z) is newer than `b`.
+pub fn newer_version(a: &str, b: &str) -> bool {
+    let p = |s: &str| s.trim().split('.').map(|n| n.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
+    let (a, b) = (p(a), p(b));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (a.get(i).copied().unwrap_or(0), b.get(i).copied().unwrap_or(0));
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+/// `.audioshare` files next to the program (the zip from AudioShare → Recorders),
+/// newest first, leaving out expired ones.
+pub fn link_files_next_to_exe() -> Vec<std::path::PathBuf> {
+    let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.to_path_buf())) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("audioshare")))
+        .filter(|p| match read_link_file(p) {
+            Ok(l) => chrono::DateTime::parse_from_rfc3339(&l.expires).map_or(true, |t| t > chrono::Local::now()),
+            Err(_) => false,
+        })
+        .map(|p| (std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH), p))
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+
+/// After a successful pairing the file is renamed, so it is not offered again.
+pub fn retire_link_file(path: &Path) {
+    let mut to = path.as_os_str().to_owned();
+    to.push(".gebruikt");
+    let _ = std::fs::rename(path, std::path::PathBuf::from(to));
 }
 
 pub fn read_link_file(path: &Path) -> Result<LinkFile, String> {
