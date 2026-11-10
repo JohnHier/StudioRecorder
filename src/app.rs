@@ -1092,6 +1092,8 @@ struct Loading {
 struct UploadPlan {
     profile_id: String,
     profile_name: String,
+    /// Studio: the local user who operated.
+    operator: String,
     program_id: i64,
     program_name: String,
     meta: Meta,
@@ -1335,7 +1337,7 @@ impl App {
         if self.is_recording() {
             return;
         }
-        let active = self.aus.active.clone();
+        let active = self.aus.session_key();
         if active != self.meta_profile {
             self.meta_profile = active.clone();
             self.meta = Meta { date: Meta::today(), ..Default::default() };
@@ -1642,6 +1644,7 @@ impl App {
         Some(UploadPlan {
             profile_id: prof.id.clone(),
             profile_name: prof.display_name.clone(),
+            operator: self.aus.operator(),
             program_id: pid,
             program_name: prog.name.clone(),
             meta: ed.meta.clone(),
@@ -1679,6 +1682,7 @@ impl App {
                     let job = crate::audioshare::queue::Job {
                         profile_id: p.profile_id,
                         profile_name: p.profile_name,
+                        operator: p.operator,
                         program_id: p.program_id,
                         program_name: p.program_name,
                         date: p.meta.date.clone(),

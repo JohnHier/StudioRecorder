@@ -65,6 +65,8 @@ pub struct Job {
     pub message: String,
     pub revision: Option<i64>,
     pub warnings: Vec<ApiWarning>,
+    /// Studio recorder: the local user who operated ("bediend door").
+    pub operator: String,
 }
 
 impl Default for Job {
@@ -95,6 +97,7 @@ impl Default for Job {
             message: String::new(),
             revision: None,
             warnings: Vec::new(),
+            operator: String::new(),
         }
     }
 }
@@ -431,8 +434,8 @@ fn run_step(q: &Queue, c: &Client, job: &mut Job) -> Step {
         JobState::Creating => {
             job.message = "Aflevering aanmaken…".into();
             let res = match (job.replace_episode, job.confirm_replace) {
-                (Some(ep), true) => c.replace(ep, &job.id, &job.title, &job.description, true),
-                _ => c.create_episode(job.program_id, &job.id, &job.date, &job.title, &job.description),
+                (Some(ep), true) => c.replace(ep, &job.id, &job.title, &job.description, true, &job.operator),
+                _ => c.create_episode(job.program_id, &job.id, &job.date, &job.title, &job.description, &job.operator),
             };
             match res {
                 Ok(d) => {
@@ -456,7 +459,7 @@ fn run_step(q: &Queue, c: &Client, job: &mut Job) -> Step {
                     }
                     job.replace_episode = ep;
                     // Ask for the warning details (always CONFIRM_REQUIRED without confirm).
-                    match c.replace(ep.unwrap(), &job.id, &job.title, &job.description, false) {
+                    match c.replace(ep.unwrap(), &job.id, &job.title, &job.description, false, &job.operator) {
                         Err(e2) if e2.code() == "CONFIRM_REQUIRED" => {
                             job.confirm_details = e2.details().clone();
                             job.state = JobState::NeedsConfirm;

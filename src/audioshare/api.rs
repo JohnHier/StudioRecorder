@@ -85,6 +85,9 @@ pub struct UserInfo {
     /// "admin" or a normal role (not in spec v0.5, sent by AudioShare).
     #[serde(default)]
     pub role: String,
+    /// "studio" for a studio recorder (AudioShare 1.5.0), otherwise "person".
+    #[serde(default)]
+    pub account_type: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -295,11 +298,15 @@ impl Client {
         date: &str,
         title: &str,
         description: &str,
+        operator: &str,
     ) -> Result<Draft, ApiError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "client_upload_id": client_upload_id, "broadcast_date": date,
             "title": title, "description": description, "parts": 1
         });
+        if !operator.is_empty() {
+            body["operator"] = operator.into();
+        }
         self.post(&format!("/api/v1/me/programs/{program_id}/episodes"), &body)
     }
 
@@ -310,11 +317,15 @@ impl Client {
         title: &str,
         description: &str,
         confirm: bool,
+        operator: &str,
     ) -> Result<Draft, ApiError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "client_upload_id": client_upload_id, "parts": 1,
             "title": title, "description": description, "confirm": confirm
         });
+        if !operator.is_empty() {
+            body["operator"] = operator.into();
+        }
         self.post(&format!("/api/v1/me/episodes/{episode_id}/replace"), &body)
     }
 
@@ -459,6 +470,9 @@ pub struct LinkFile {
     pub claim_code: String,
     #[serde(default)]
     pub expires: String,
+    /// "studio" when AudioShare made this file for a studio (Recorders → Studio's).
+    #[serde(default, rename = "kind")]
+    pub link_kind: String,
 }
 
 /// True when version `a` (x.y.z) is newer than `b`.

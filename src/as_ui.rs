@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::audioshare::api::{self, ApiError, Client, Program, UploadInfo};
-use crate::audioshare::profiles::{self, Profile, Store, Unlock, computer_name};
+use crate::audioshare::profiles::{self, LocalUnlock, Profile, Store, Unlock, computer_name};
 use crate::audioshare::queue::{Job, JobState, Level, Queue, mmss};
 use crossbeam_channel::{Sender, unbounded};
 use std::collections::HashSet;
@@ -30,6 +30,10 @@ pub(super) struct LinkForm {
     from_file: Option<String>,
     /// The `.audioshare` file this form came from; retired after pairing.
     file_path: Option<std::path::PathBuf>,
+    /// The file says this is a studio link (AudioShare → Recorders → Studio's).
+    studio: bool,
+    /// Studio link: name of the studio manager (first local user).
+    manager_name: String,
     busy: bool,
     error: Option<String>,
     done: Option<String>,
@@ -60,6 +64,25 @@ pub(super) struct AsUi {
     /// Messages for the toast line, collected during housekeeping.
     pub notices: Vec<(String, bool)>,
     update_notified: bool,
+    /// Studio mode: the signed-in local user.
+    local_user: Option<String>,
+    /// Studio mode: the studio link as the signed-in local user sees it
+    /// (their name, their programmes, manager = "admin").
+    studio_view: Option<Profile>,
+    /// Studio mode: the users dialog in the settings.
+    pub users_form: Option<UsersForm>,
+}
+
+#[derive(Default)]
+pub(super) struct UsersForm {
+    /// None = new user.
+    editing: Option<String>,
+    name: String,
+    pin: String,
+    pin2: String,
+    manager: bool,
+    programs: HashSet<i64>,
+    msg: Option<(String, bool)>,
 }
 
 impl AsUi {
@@ -79,14 +102,70 @@ impl AsUi {
             test_msg: None,
             notices: Vec::new(),
             update_notified: false,
+            local_user: None,
+            studio_view: None,
+            users_form: None,
         };
-        // Always start logged out.
+        // Always start logged out. A studio's token is always available (Credential
+        // Manager), so its queued uploads carry on without anyone signed in.
+        if let Some(st) = a.store.studio() {
+            if let Some(tok) = crate::audioshare::secure::load_token(&st.id) {
+                a.queue.tokens.lock().unwrap().insert(st.id.clone(), (st.url.clone(), tok));
+            }
+        }
         a
     }
 
-    /// Is there an admin profile on this PC?
+    /// This PC is linked as a studio: people sign in as local users.
+    pub fn is_studio(&self) -> bool {
+        self.store.studio().is_some()
+    }
+
+    fn studio_id(&self) -> Option<String> {
+        self.store.studio().map(|p| p.id.clone())
+    }
+
+    /// Who operated, sent with each upload from a studio.
+    pub fn operator(&self) -> String {
+        match (self.is_studio(), &self.local_user) {
+            (true, Some(id)) => self.store.local_user(id).map(|u| u.name.clone()).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// Changes when another person signs in (also between local users of a studio).
+    pub fn session_key(&self) -> Option<String> {
+        self.active.as_ref().map(|a| format!("{a}/{}", self.local_user.clone().unwrap_or_default()))
+    }
+
+    fn rebuild_view(&mut self) {
+        self.studio_view = match (self.store.studio(), &self.local_user) {
+            (Some(st), Some(uid)) => self.store.local_user(uid).map(|u| {
+                let mut v = st.clone();
+                v.display_name = u.name.clone();
+                v.role = if u.manager { "admin".into() } else { String::new() };
+                v.programs = self.store.programs_for(uid);
+                v
+            }),
+            _ => None,
+        };
+    }
+
+    fn studio_sign_in(&mut self, user_id: &str) {
+        let Some(st) = self.store.studio().cloned() else { return };
+        let token = self.queue.tokens.lock().unwrap().get(&st.id).map(|t| t.1.clone()).or_else(|| crate::audioshare::secure::load_token(&st.id));
+        let Some(token) = token else {
+            self.notices.push(("De studiokoppeling is niet meer geldig. Koppel de studio opnieuw met een nieuwe code van de admin.".into(), true));
+            return;
+        };
+        self.local_user = Some(user_id.to_string());
+        self.activate(&st.id, token);
+        self.rebuild_view();
+    }
+
+    /// Is there an admin profile on this PC? (A studio always has a manager.)
     pub fn has_admin(&self) -> bool {
-        self.store.profiles.iter().any(|p| p.is_admin())
+        self.is_studio() || self.store.profiles.iter().any(|p| p.is_admin())
     }
 
     /// May the current user change settings? Yes for an admin, and for
@@ -104,6 +183,9 @@ impl AsUi {
     }
 
     pub fn active_profile(&self) -> Option<&Profile> {
+        if self.is_studio() {
+            return self.active.as_ref().and(self.studio_view.as_ref());
+        }
         self.active.as_ref().and_then(|id| self.store.get(id))
     }
 
@@ -147,7 +229,11 @@ impl AsUi {
     }
 
     /// Drop a token from memory, unless its uploads are still running (§4.4).
+    /// A studio's token stays: it is not tied to a person.
     fn release_token(&self, id: &str) {
+        if self.store.get(id).is_some_and(|p| p.is_studio()) {
+            return;
+        }
         if !self.queue.has_open_jobs(id) {
             self.queue.tokens.lock().unwrap().remove(id);
         }
@@ -157,6 +243,9 @@ impl AsUi {
         if let Some(id) = self.active.take() {
             self.release_token(&id);
         }
+        self.local_user = None;
+        self.studio_view = None;
+        self.users_form = None;
         self.confirm_job = None;
     }
 
@@ -188,12 +277,18 @@ impl AsUi {
     }
 
     fn unlinked(&mut self, id: &str) {
+        let studio = self.store.get(id).is_some_and(|p| p.is_studio());
         self.store.mark_unlinked(id);
         self.queue.tokens.lock().unwrap().remove(id);
         if self.active.as_deref() == Some(id) {
-            self.active = None;
+            self.sign_out();
         }
-        self.notices.push(("Deze recorder is ontkoppeld — vraag je beheerder om een nieuwe koppelcode.".into(), true));
+        let msg = if studio {
+            "Deze studio is in AudioShare ontkoppeld — de admin maakt een nieuwe koppelcode (Recorders → Studio's)."
+        } else {
+            "Deze recorder is ontkoppeld — vraag je beheerder om een nieuwe koppelcode."
+        };
+        self.notices.push((msg.into(), true));
     }
 
     pub fn open_link(&mut self, file: Option<&Path>) {
@@ -217,6 +312,7 @@ impl AsUi {
                     }
                     f.from_file = Some(src);
                     f.file_path = Some(p.to_path_buf());
+                    f.studio = l.link_kind.eq_ignore_ascii_case("studio");
                 }
                 Err(e) => f.error = Some(e),
             }
@@ -282,6 +378,7 @@ impl AsUi {
                             self.store.save();
                         }
                     }
+                    self.rebuild_view();
                 }
                 Msg::Programs(id, Err(e)) => {
                     if e.is_temporary() {
@@ -386,6 +483,7 @@ impl AsUi {
                 let claim = c.claim(&code, &device).map_err(|e| e.user_message())?;
                 let c = Client::new(&url, Some(claim.token.clone()));
                 let role = c.me().map(|m| m.user.role).unwrap_or_default();
+                let account_type = claim.user.account_type.clone();
                 let (programs, warn) = match c.programs() {
                     Ok(p) => (p, None),
                     Err(e) => (Vec::new(), Some(e.user_message())),
@@ -399,6 +497,7 @@ impl AsUi {
                     linked_at: chrono::Local::now().format("%d-%m-%Y %H:%M").to_string(),
                     programs,
                     role,
+                    account_type,
                     ..Default::default()
                 };
                 Ok((p, claim.token, warn))
@@ -410,7 +509,36 @@ impl AsUi {
     fn finish_claim(&mut self, r: Result<(Profile, String, Option<String>), String>) {
         let pin = self.link.as_ref().map(|f| f.pin.clone());
         let file = self.link.as_ref().and_then(|f| f.file_path.clone());
+        let manager = self.link.as_ref().map(|f| f.manager_name.clone()).unwrap_or_default();
         let res = r.and_then(|(p, token, warn)| {
+            if p.is_studio() {
+                let studio = p.display_name.clone();
+                let names: Vec<String> = p.programs.iter().map(|x| x.name.clone()).collect();
+                let (_, new_manager) = self.store.add_studio(p, &token, &manager, pin.as_deref().unwrap_or(""))?;
+                if let Some(f) = &file {
+                    api::retire_link_file(f);
+                }
+                if let Some(sid) = self.studio_id() {
+                    self.queue.tokens.lock().unwrap().insert(sid.clone(), (self.store.get(&sid).map(|x| x.url.clone()).unwrap_or_default(), token));
+                }
+                self.sign_out();
+                let who = match &new_manager {
+                    Some(mid) => {
+                        self.studio_sign_in(mid);
+                        format!("Je bent ingelogd als studiobeheerder {}.", self.operator())
+                    }
+                    None => "De bestaande gebruikers van deze pc zijn behouden.".to_string(),
+                };
+                let progs = if names.is_empty() {
+                    "AudioShare geeft nog geen programma's voor deze studio: laat de admin ze aanvinken (Recorders → Studio's).".to_string()
+                } else {
+                    format!("Programma's: {}.", names.join(", "))
+                };
+                if let Some(w) = warn {
+                    return Ok(format!("Deze pc is gekoppeld als {studio}. {who} Programmalijst ophalen mislukte: {w}"));
+                }
+                return Ok(format!("Deze pc is gekoppeld als {studio}. {who} {progs}"));
+            }
             let names: Vec<String> = p.programs.iter().map(|x| x.name.clone()).collect();
             let who = p.display_name.clone();
             let id = self.store.add(p, &token, pin.as_deref())?;
@@ -462,7 +590,8 @@ impl AsUi {
                         self.sign_out();
                     }
                     let badge = if self.is_admin() { " (beheerder)" } else { "" };
-                    ui.label(egui::RichText::new(format!("Ingelogd als {n}{badge}")).strong().color(GREEN));
+                    let studio = self.store.studio().map(|s| format!(" · {}", s.display_name)).unwrap_or_default();
+                    ui.label(egui::RichText::new(format!("Ingelogd als {n}{badge}{studio}")).strong().color(GREEN));
                 }
                 None => {
                     if ibutton(ui, None, "Inloggen", true, Some(Color32::from_rgb(0x1f, 0x5f, 0x9e))).clicked() {
@@ -492,8 +621,13 @@ impl AsUi {
 
     pub fn windows(&mut self, ctx: &egui::Context) {
         self.link_window(ctx);
-        self.unlock_window(ctx);
+        if self.is_studio() {
+            self.studio_unlock_window(ctx);
+        } else {
+            self.unlock_window(ctx);
+        }
         self.confirm_window(ctx);
+        self.users_window(ctx);
     }
 
     fn link_window(&mut self, ctx: &egui::Context) {
@@ -514,15 +648,24 @@ impl AsUi {
                     ui.add_space(6.0);
                     ui.label(egui::RichText::new(done).size(16.0).strong().color(GREEN));
                     ui.add_space(6.0);
-                    ui.label("Je programma's staan nu in de keuzelijst op het opnamescherm.");
+                    if f.studio {
+                        ui.label("Maak nu onder Instellingen → Gebruikers de technici en makers aan, met hun programma's.");
+                    } else {
+                        ui.label("Je programma's staan nu in de keuzelijst op het opnamescherm.");
+                    }
                     ui.add_space(10.0);
                     if ibutton(ui, None, "Klaar", true, Some(Color32::from_rgb(0x1f, 0x7a, 0x52))).clicked() {
                         close = true;
                     }
                     return;
                 }
-                ui.label("Je beheerder heeft je een persoonlijke koppelcode of een koppelbestand (.audioshare) gegeven.");
-                if shared {
+                if f.studio {
+                    ui.label(egui::RichText::new("Deze pc wordt gekoppeld als studio.").strong());
+                    ui.label("Wie hier werkt, logt straks in als lokale gebruiker. Kies nu de naam en pincode van de studiobeheerder: die maakt de gebruikers aan en wijst hun programma's toe.");
+                } else {
+                    ui.label("Je beheerder heeft je een persoonlijke koppelcode of een koppelbestand (.audioshare) gegeven.");
+                }
+                if shared && !f.studio {
                     ui.label(
                         egui::RichText::new("Elke maker koppelt zijn eigen code en kiest een eigen pincode om mee in te loggen.").color(PURPLE),
                     );
@@ -549,8 +692,13 @@ impl AsUi {
                     ui.label("Naam van dit apparaat");
                     ui.add_enabled(!f.busy, egui::TextEdit::singleline(&mut f.device).desired_width(200.0));
                     ui.end_row();
+                    if f.studio {
+                        ui.label("Naam studiobeheerder");
+                        ui.add_enabled(!f.busy, egui::TextEdit::singleline(&mut f.manager_name).hint_text(egui::RichText::new("bijv. Anne").color(HINT)).desired_width(200.0));
+                        ui.end_row();
+                    }
                     if shared {
-                        ui.label("Kies een pincode");
+                        ui.label(if f.studio { "Beheerpincode" } else { "Kies een pincode" });
                         ui.add_enabled(!f.busy, egui::TextEdit::singleline(&mut f.pin).password(true).hint_text(egui::RichText::new("minimaal 4 cijfers").color(HINT)).desired_width(140.0));
                         ui.end_row();
                         ui.label("Herhaal pincode");
@@ -582,12 +730,13 @@ impl AsUi {
             });
         if pick_file {
             if let Some(p) = rfd::FileDialog::new().add_filter("AudioShare koppelbestand", &["audioshare"]).pick_file() {
-                let (pin, pin2, device) = (f.pin.clone(), f.pin2.clone(), f.device.clone());
+                let (pin, pin2, device, mgr) = (f.pin.clone(), f.pin2.clone(), f.device.clone(), f.manager_name.clone());
                 self.open_link(Some(&p));
                 if let Some(nf) = self.link.as_mut() {
                     nf.pin = pin;
                     nf.pin2 = pin2;
                     nf.device = device;
+                    nf.manager_name = mgr;
                 }
             }
             return;
@@ -847,14 +996,24 @@ impl AsUi {
             let d = self.queue.data.lock().unwrap();
             // An admin sees everyone's uploads on this PC.
             let all = profile.is_admin();
-            let jobs: Vec<Job> = d.jobs.iter().filter(|j| all || j.profile_id == profile.id).cloned().collect();
+            let studio = profile.is_studio();
+            let jobs: Vec<Job> = d
+                .jobs
+                .iter()
+                .filter(|j| all || (j.profile_id == profile.id && (!studio || j.operator == profile.display_name)))
+                .cloned()
+                .collect();
             let log: Vec<_> = d.log.iter().filter(|l| all || l.profile == profile.display_name).cloned().collect();
             (jobs, log)
         };
         let progress = self.queue.progress.lock().unwrap().as_ref().map(|(id, sent, total)| (id.clone(), sent.load(Ordering::Relaxed), *total));
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Uploadwachtrij").size(18.0).strong());
-            let who = if profile.is_admin() { "alle makers (beheerder)".to_string() } else { profile.display_name.clone() };
+            let who = if profile.is_admin() {
+                if profile.is_studio() { "iedereen in deze studio (beheerder)".to_string() } else { "alle makers (beheerder)".to_string() }
+            } else {
+                profile.display_name.clone()
+            };
             ui.label(egui::RichText::new(format!("— {who}")).color(DIM));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ibutton(ui, None, "Afgeronde verwijderen", jobs.iter().any(|j| !j.state.is_open()), None).clicked() {
@@ -937,6 +1096,9 @@ impl AsUi {
             if j.state == JobState::Waiting && !self.queue.tokens.lock().unwrap().contains_key(&j.profile_id) {
                 ui.label(egui::RichText::new(format!("Wacht tot {} inlogt", j.profile_name)).color(AMBER));
             }
+            if !j.operator.is_empty() {
+                ui.label(egui::RichText::new(format!("Bediend door {}", j.operator)).color(DIM).size(12.0));
+            }
             for w in &j.warnings {
                 ui.label(egui::RichText::new(&w.message).color(AMBER));
             }
@@ -983,7 +1145,9 @@ impl AsUi {
         if let Some((m, err)) = &self.test_msg {
             ui.label(egui::RichText::new(m).color(if *err { RED } else { GREEN }));
         }
-        if ui.button("Maker koppelen…").clicked() {
+        if self.is_studio() {
+            self.studio_settings(ui);
+        } else if ui.button("Maker koppelen…").clicked() {
             self.open_link(None);
         }
         if let Some(id) = test {
@@ -1036,5 +1200,268 @@ impl AsUi {
     pub fn open_count(&self) -> usize {
         let Some(id) = &self.active else { return 0 };
         self.queue.data.lock().unwrap().jobs.iter().filter(|j| &j.profile_id == id && j.state.is_open()).count()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Studio mode (AudioShare 1.5.0): local users with a PIN, chosen by the
+// studio manager, each with a selection of the studio's programmes.
+// ---------------------------------------------------------------------------
+
+impl AsUi {
+    fn studio_unlock_window(&mut self, ctx: &egui::Context) {
+        if self.unlock.is_none() {
+            return;
+        }
+        let Some(studio) = self.store.studio().cloned() else { return };
+        let users = self.store.local_users.clone();
+        let mut open = true;
+        let mut try_pin: Option<(String, String)> = None;
+        let mut relink = false;
+        let f = self.unlock.as_mut().unwrap();
+        if f.selected.is_none() && users.len() == 1 {
+            f.selected = Some(users[0].id.clone());
+            f.focus = true;
+        }
+        egui::Window::new(format!("Inloggen — {}", studio.display_name))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                if studio.needs_relink {
+                    ui.label(egui::RichText::new("Deze studio is in AudioShare ontkoppeld. Opnemen en bewerken kan; uploaden pas na opnieuw koppelen met een nieuwe code van de admin.").color(AMBER));
+                    if ui.button("Studio opnieuw koppelen…").clicked() {
+                        relink = true;
+                    }
+                    ui.add_space(6.0);
+                }
+                ui.label("Wie ben je?");
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for u in &users {
+                        let sel = f.selected.as_deref() == Some(&u.id);
+                        let label = if u.manager { format!("{}  (beheerder)", u.name) } else { u.name.clone() };
+                        if ui.add_sized([380.0, 32.0], egui::Button::selectable(sel, egui::RichText::new(label).size(15.0))).clicked() {
+                            f.selected = Some(u.id.clone());
+                            f.pin.clear();
+                            f.msg = None;
+                            f.focus = true;
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                if let Some(id) = f.selected.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label("Pincode");
+                        let r = ui.add(egui::TextEdit::singleline(&mut f.pin).password(true).desired_width(140.0));
+                        if f.focus {
+                            r.request_focus();
+                            f.focus = false;
+                        }
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if ui.button("Inloggen").clicked() || enter {
+                            try_pin = Some((id, f.pin.clone()));
+                        }
+                    });
+                }
+                if let Some(m) = &f.msg {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(m).color(RED));
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Nog geen gebruiker of pincode vergeten? Vraag de studiobeheerder.").size(12.0).color(DIM));
+            });
+        if relink {
+            self.unlock = None;
+            self.open_link(None);
+            return;
+        }
+        if let Some((id, pin)) = try_pin {
+            let r = self.store.unlock_local(&id, &pin);
+            let f = self.unlock.as_mut().unwrap();
+            f.pin.clear();
+            f.focus = true;
+            match r {
+                LocalUnlock::Ok => {
+                    self.unlock = None;
+                    self.studio_sign_in(&id);
+                    return;
+                }
+                LocalUnlock::Wrong { attempts_left } => {
+                    f.msg = Some(format!("Onjuiste pincode — nog {attempts_left} poging(en) voordat je 5 minuten moet wachten."))
+                }
+                LocalUnlock::Locked { seconds } => {
+                    f.msg = Some(format!("Te veel foute pogingen. Probeer het over {} opnieuw, of vraag de studiobeheerder om een nieuwe pincode.", mmss(seconds as f64)))
+                }
+            }
+        }
+        if !open {
+            self.unlock = None;
+        }
+    }
+
+    /// Settings → AudioShare, studio part (only reachable for a manager).
+    fn studio_settings(&mut self, ui: &mut egui::Ui) {
+        let Some(st) = self.store.studio().cloned() else { return };
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(format!("Studio: {}", st.display_name)).strong());
+        let progs: Vec<String> = st.programs.iter().map(|p| p.name.clone()).collect();
+        ui.label(
+            egui::RichText::new(if progs.is_empty() {
+                "AudioShare staat voor deze studio nog geen programma's toe (de admin vinkt ze aan bij Recorders → Studio's).".to_string()
+            } else {
+                format!("Mag aanleveren voor: {}", progs.join(", "))
+            })
+            .color(DIM)
+            .size(12.5),
+        );
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Gebruikers").strong());
+        let users = self.store.local_users.clone();
+        let mut edit: Option<String> = None;
+        egui::Grid::new("local_users").num_columns(3).spacing(vec2(14.0, 6.0)).show(ui, |ui| {
+            for u in &users {
+                let name = if u.manager { format!("{} (beheerder)", u.name) } else { u.name.clone() };
+                ui.label(egui::RichText::new(name).strong());
+                let mine: Vec<String> = if u.manager {
+                    vec!["alle programma's".into()]
+                } else {
+                    st.programs.iter().filter(|p| u.programs.contains(&p.id)).map(|p| p.name.clone()).collect()
+                };
+                ui.label(
+                    egui::RichText::new(if mine.is_empty() { "nog geen programma's".to_string() } else { mine.join(", ") })
+                        .color(if mine.is_empty() { AMBER } else { DIM })
+                        .size(12.5),
+                );
+                if ui.small_button("Wijzigen…").clicked() {
+                    edit = Some(u.id.clone());
+                }
+                ui.end_row();
+            }
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("Gebruiker toevoegen…").clicked() {
+                self.users_form = Some(UsersForm::default());
+            }
+            if ui.button("Studio opnieuw koppelen…").on_hover_text("Met een nieuwe koppelcode van de admin. Gebruikers en instellingen blijven behouden.").clicked() {
+                self.open_link(None);
+            }
+        });
+        if let Some(id) = edit {
+            if let Some(u) = self.store.local_user(&id) {
+                self.users_form = Some(UsersForm {
+                    editing: Some(u.id.clone()),
+                    name: u.name.clone(),
+                    manager: u.manager,
+                    programs: u.programs.iter().copied().collect(),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    fn users_window(&mut self, ctx: &egui::Context) {
+        if self.users_form.is_none() || !self.is_admin() {
+            return;
+        }
+        let Some(st) = self.store.studio().cloned() else { return };
+        let mut open = true;
+        let mut save = false;
+        let mut delete = false;
+        let f = self.users_form.as_mut().unwrap();
+        let title = if f.editing.is_some() { "Gebruiker wijzigen" } else { "Gebruiker toevoegen" };
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(460.0)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                egui::Grid::new("user_form").num_columns(2).spacing(vec2(12.0, 8.0)).show(ui, |ui| {
+                    ui.label("Naam");
+                    ui.add(egui::TextEdit::singleline(&mut f.name).hint_text(egui::RichText::new("bijv. Kees").color(HINT)).desired_width(220.0));
+                    ui.end_row();
+                    ui.label(if f.editing.is_some() { "Nieuwe pincode" } else { "Pincode" });
+                    ui.add(egui::TextEdit::singleline(&mut f.pin).password(true).hint_text(egui::RichText::new(if f.editing.is_some() { "leeg = ongewijzigd" } else { "minimaal 4 cijfers" }).color(HINT)).desired_width(140.0));
+                    ui.end_row();
+                    ui.label("Herhaal pincode");
+                    ui.add(egui::TextEdit::singleline(&mut f.pin2).password(true).desired_width(140.0));
+                    ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut f.manager, "Studiobeheerder (instellingen, gebruikers, alle programma's)");
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Mag uploaden voor").strong());
+                if f.manager {
+                    ui.label(egui::RichText::new("Een studiobeheerder mag alle programma's van deze studio uploaden.").color(DIM));
+                } else if st.programs.is_empty() {
+                    ui.label(egui::RichText::new("AudioShare staat voor deze studio nog geen programma's toe.").color(AMBER));
+                } else {
+                    for p in &st.programs {
+                        let mut on = f.programs.contains(&p.id);
+                        if ui.checkbox(&mut on, &p.name).changed() {
+                            if on {
+                                f.programs.insert(p.id);
+                            } else {
+                                f.programs.remove(&p.id);
+                            }
+                        }
+                    }
+                }
+                if let Some((m, err)) = &f.msg {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new(m).color(if *err { RED } else { GREEN }));
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ibutton(ui, None, "Opslaan", true, Some(Color32::from_rgb(0x1f, 0x7a, 0x52))).clicked() {
+                        save = true;
+                    }
+                    if f.editing.is_some() && ui.button("Verwijderen").clicked() {
+                        delete = true;
+                    }
+                });
+            });
+        if save {
+            let f = self.users_form.as_mut().unwrap();
+            let programs: Vec<i64> = st.programs.iter().map(|p| p.id).filter(|id| f.programs.contains(id)).collect();
+            let r = if !f.pin.is_empty() && f.pin != f.pin2 {
+                Err("De twee pincodes zijn niet gelijk.".to_string())
+            } else {
+                match f.editing.clone() {
+                    None => self.store.add_local_user(&f.name, &f.pin, programs, f.manager).map(|_| ()),
+                    Some(id) => self.store.update_local_user(&id, &f.name, programs, f.manager).and_then(|_| {
+                        if f.pin.is_empty() { Ok(()) } else { self.store.set_local_pin(&id, &f.pin) }
+                    }),
+                }
+            };
+            match r {
+                Ok(()) => {
+                    self.users_form = None;
+                    self.rebuild_view();
+                    // A manager who took away their own role is no longer a manager
+                    return;
+                }
+                Err(e) => self.users_form.as_mut().unwrap().msg = Some((e, true)),
+            }
+        }
+        if delete {
+            let id = self.users_form.as_ref().and_then(|f| f.editing.clone()).unwrap_or_default();
+            if self.local_user.as_deref() == Some(id.as_str()) {
+                self.users_form.as_mut().unwrap().msg = Some(("Je kunt jezelf niet verwijderen terwijl je bent ingelogd.".into(), true));
+            } else {
+                match self.store.remove_local_user(&id) {
+                    Ok(()) => self.users_form = None,
+                    Err(e) => self.users_form.as_mut().unwrap().msg = Some((e, true)),
+                }
+            }
+        }
+        if !open {
+            self.users_form = None;
+        }
     }
 }

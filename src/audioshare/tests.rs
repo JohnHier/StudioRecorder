@@ -129,10 +129,13 @@ fn full_flow_against_mock_server() {
         quality: progs[0].quality.clone(),
         ..Default::default()
     };
-    let j1 = base.clone();
+    let j1 = Job { operator: "Kees (techniek)".into(), ..base.clone() };
     q.add(j1.clone());
     let done = wait_for(&q, &j1.id, |j| j.state == JobState::Done, 20);
     assert_eq!(done.revision, Some(1));
+    // the operator travels with the draft (studio recorder, AudioShare 1.5.0)
+    let draft = c.get_draft(done.draft_id.unwrap()).unwrap();
+    assert_eq!(draft["operator"], "Kees (techniek)");
 
     // --- same date again: own episode -> confirm -> replaced
     let j2 = Job { id: uuid::Uuid::new_v4().to_string(), title: "Test 1 (nieuw)".into(), ..base.clone() };
@@ -199,10 +202,11 @@ fn link_file_is_read() {
     let p = d.join("jan-devries.audioshare");
     std::fs::write(
         &p,
-        r#"{"type":"audioshare-maker-link","version":1,"url":"https://platform.br6.nl","user":"Jan de Vries","claim_code":"K7QX-M2PL-9RTA","expires":"2026-10-19T11:50:00+02:00"}"#,
+        r#"{"type":"audioshare-maker-link","version":1,"url":"https://platform.br6.nl","user":"Jan de Vries","claim_code":"K7QX-M2PL-9RTA","expires":"2026-10-19T11:50:00+02:00","kind":"studio"}"#,
     )
     .unwrap();
     let l = read_link_file(&p).unwrap();
+    assert_eq!(l.link_kind, "studio");
     assert_eq!(l.claim_code, "K7QX-M2PL-9RTA");
     assert_eq!(normalize_url("platform.br6.nl/"), "https://platform.br6.nl");
     std::fs::write(&p, "{}").unwrap();
@@ -260,4 +264,40 @@ fn link_file_is_retired() {
     assert!(!p.exists());
     assert!(d.join("jan.audioshare.gebruikt").exists());
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Against a real AudioShare (1.5.0+): AS_URL and AS_STUDIO_CODE (a studio
+/// coupling code) in the environment. `cargo test -- --ignored studio_real`.
+#[test]
+#[ignore]
+fn studio_real_server() {
+    let (Ok(url), Ok(code)) = (std::env::var("AS_URL"), std::env::var("AS_STUDIO_CODE")) else { return };
+    let c = Client::new(&url, None);
+    let claim = c.claim(&code, "STUDIO-TEST").unwrap();
+    assert_eq!(claim.user.account_type, "studio");
+    let c = Client::new(&url, Some(claim.token.clone()));
+    assert_eq!(c.me().unwrap().user.account_type, "studio");
+    let progs = c.programs().unwrap();
+    assert!(!progs.is_empty());
+    let mp3 = make_mp3("as_studio_real", 8);
+    let q = Queue::start();
+    q.tokens.lock().unwrap().insert("st".into(), (url.clone(), claim.token.clone()));
+    let j = Job {
+        profile_id: "st".into(),
+        profile_name: "Kees".into(),
+        operator: "Kees".into(),
+        program_id: progs[0].id,
+        program_name: progs[0].name.clone(),
+        date: future_date(9),
+        title: "Studio-test".into(),
+        file: mp3,
+        duration_sec: 8.0,
+        sample_rate: 48000,
+        quality: progs[0].quality.clone(),
+        ..Default::default()
+    };
+    q.add(j.clone());
+    let done = wait_for(&q, &j.id, |j| matches!(j.state, JobState::Done | JobState::Failed), 30);
+    assert_eq!(done.state, JobState::Done, "{}", done.message);
+    println!("EPISODE {}", done.episode_id.unwrap());
 }

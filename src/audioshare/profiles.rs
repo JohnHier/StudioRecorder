@@ -30,12 +30,50 @@ pub struct Profile {
     pub programs: Vec<Program>,
     /// Role in AudioShare ("admin" may change the recorder's settings).
     pub role: String,
+    /// "studio": this PC is linked as a studio (AudioShare 1.5.0). The token
+    /// then lives in Windows Credential Manager and people sign in as local users.
+    pub account_type: String,
 }
 
 impl Profile {
     pub fn is_admin(&self) -> bool {
         self.role.eq_ignore_ascii_case("admin")
     }
+    pub fn is_studio(&self) -> bool {
+        self.account_type.eq_ignore_ascii_case("studio")
+    }
+}
+
+/// A person who works in a linked studio. Exists only on this PC; the studio
+/// manager creates them and picks their programmes from the studio's list.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LocalUser {
+    pub id: String,
+    pub name: String,
+    /// The PIN, as a sealed check value (never stored readable).
+    pub pin: Option<Sealed>,
+    /// Programme ids from the studio's list. Ignored for a manager (all).
+    pub programs: Vec<i64>,
+    /// Studio manager: settings, users, all programmes, all uploads.
+    pub manager: bool,
+    pub pin_fails: u32,
+    pub locked_until: i64,
+}
+
+const PIN_CHECK: &str = "studiorecorder-local-user";
+
+pub enum LocalUnlock {
+    Ok,
+    Wrong { attempts_left: u32 },
+    Locked { seconds: i64 },
+}
+
+pub fn valid_pin(pin: &str) -> Result<(), String> {
+    if pin.len() < 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
+        return Err("De pincode moet uit minimaal 4 cijfers bestaan.".into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,11 +83,13 @@ pub struct Store {
     pub shared: bool,
     pub auto_lock_minutes: u32,
     pub profiles: Vec<Profile>,
+    /// Studio mode: the people who work here (see LocalUser).
+    pub local_users: Vec<LocalUser>,
 }
 
 impl Default for Store {
     fn default() -> Self {
-        Store { shared: true, auto_lock_minutes: 15, profiles: Vec::new() }
+        Store { shared: true, auto_lock_minutes: 15, profiles: Vec::new(), local_users: Vec::new() }
     }
 }
 
@@ -185,6 +225,155 @@ impl Store {
         self.save();
         res
     }
+
+    // -----------------------------------------------------------------------
+    // Studio mode
+    // -----------------------------------------------------------------------
+
+    /// The studio link of this PC, if it is linked as a studio.
+    pub fn studio(&self) -> Option<&Profile> {
+        self.profiles.iter().find(|p| p.is_studio())
+    }
+
+    /// Store a studio link. The token goes to Windows Credential Manager, so
+    /// queued uploads continue without anyone signed in. An earlier studio
+    /// link is replaced; local users are kept. Without local users the first
+    /// one becomes the studio manager. Returns (profile id, manager id if new).
+    pub fn add_studio(&mut self, p: Profile, token: &str, manager_name: &str, pin: &str) -> Result<(String, Option<String>), String> {
+        let new_manager = if self.local_users.iter().any(|u| u.manager) {
+            None
+        } else {
+            valid_pin(pin)?;
+            let name = if manager_name.trim().is_empty() { "Studiobeheerder" } else { manager_name.trim() };
+            Some(self.new_local_user(name, pin, Vec::new(), true)?)
+        };
+        secure::store_token(&p.id, token)?;
+        let old: Vec<String> = self.profiles.iter().filter(|x| x.is_studio()).map(|x| x.id.clone()).collect();
+        for id in old {
+            secure::delete_token(&id);
+            self.profiles.retain(|x| x.id != id);
+        }
+        let id = p.id.clone();
+        self.profiles.push(p);
+        if let Some(u) = &new_manager {
+            self.local_users.push(u.clone());
+        }
+        self.sort_users();
+        self.save();
+        Ok((id, new_manager.map(|u| u.id)))
+    }
+
+    fn new_local_user(&self, name: &str, pin: &str, programs: Vec<i64>, manager: bool) -> Result<LocalUser, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Vul een naam in.".into());
+        }
+        if self.local_users.iter().any(|u| u.name.eq_ignore_ascii_case(name)) {
+            return Err(format!("Er is al een gebruiker {name}."));
+        }
+        valid_pin(pin)?;
+        Ok(LocalUser {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            pin: Some(secure::seal(PIN_CHECK, pin)?),
+            programs,
+            manager,
+            ..Default::default()
+        })
+    }
+
+    fn sort_users(&mut self) {
+        self.local_users.sort_by_key(|u| (!u.manager, u.name.to_lowercase()));
+    }
+
+    pub fn local_user(&self, id: &str) -> Option<&LocalUser> {
+        self.local_users.iter().find(|u| u.id == id)
+    }
+
+    pub fn add_local_user(&mut self, name: &str, pin: &str, programs: Vec<i64>, manager: bool) -> Result<String, String> {
+        let u = self.new_local_user(name, pin, programs, manager)?;
+        let id = u.id.clone();
+        self.local_users.push(u);
+        self.sort_users();
+        self.save();
+        Ok(id)
+    }
+
+    /// Change a user's name, programmes and manager flag (the last manager stays one).
+    pub fn update_local_user(&mut self, id: &str, name: &str, programs: Vec<i64>, manager: bool) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("Vul een naam in.".into());
+        }
+        if self.local_users.iter().any(|u| u.id != id && u.name.eq_ignore_ascii_case(name)) {
+            return Err(format!("Er is al een gebruiker {name}."));
+        }
+        let others_manage = self.local_users.iter().any(|u| u.id != id && u.manager);
+        let u = self.local_users.iter_mut().find(|u| u.id == id).ok_or("Gebruiker niet gevonden")?;
+        if u.manager && !manager && !others_manage {
+            return Err("Er moet minstens één studiobeheerder zijn.".into());
+        }
+        u.name = name.to_string();
+        u.programs = programs;
+        u.manager = manager;
+        self.sort_users();
+        self.save();
+        Ok(())
+    }
+
+    /// New PIN for a user (by the manager, or by the user after a lockout); unblocks.
+    pub fn set_local_pin(&mut self, id: &str, pin: &str) -> Result<(), String> {
+        valid_pin(pin)?;
+        let sealed = secure::seal(PIN_CHECK, pin)?;
+        let u = self.local_users.iter_mut().find(|u| u.id == id).ok_or("Gebruiker niet gevonden")?;
+        u.pin = Some(sealed);
+        u.pin_fails = 0;
+        u.locked_until = 0;
+        self.save();
+        Ok(())
+    }
+
+    pub fn remove_local_user(&mut self, id: &str) -> Result<(), String> {
+        let u = self.local_user(id).ok_or("Gebruiker niet gevonden")?;
+        if u.manager && !self.local_users.iter().any(|x| x.id != id && x.manager) {
+            return Err("De laatste studiobeheerder kan niet worden verwijderd.".into());
+        }
+        self.local_users.retain(|u| u.id != id);
+        self.save();
+        Ok(())
+    }
+
+    /// Check a local user's PIN: 5 wrong in a row = 5 minutes locked (again and again).
+    pub fn unlock_local(&mut self, id: &str, pin: &str) -> LocalUnlock {
+        let t = now();
+        let Some(u) = self.local_users.iter_mut().find(|u| u.id == id) else { return LocalUnlock::Wrong { attempts_left: 0 } };
+        if u.locked_until > t {
+            return LocalUnlock::Locked { seconds: u.locked_until - t };
+        }
+        let ok = u.pin.as_ref().and_then(|s| secure::open(s, pin)).as_deref() == Some(PIN_CHECK);
+        let res = if ok {
+            u.pin_fails = 0;
+            u.locked_until = 0;
+            LocalUnlock::Ok
+        } else {
+            u.pin_fails += 1;
+            if u.pin_fails % 5 == 0 {
+                u.locked_until = t + 300;
+                LocalUnlock::Locked { seconds: 300 }
+            } else {
+                LocalUnlock::Wrong { attempts_left: 5 - u.pin_fails % 5 }
+            }
+        };
+        self.save();
+        res
+    }
+
+    /// The programmes a local user may upload: the studio's list, narrowed to
+    /// the user's selection (a manager gets them all).
+    pub fn programs_for(&self, user_id: &str) -> Vec<super::api::Program> {
+        let (Some(st), Some(u)) = (self.studio(), self.local_user(user_id)) else { return Vec::new() };
+        st.programs.iter().filter(|p| u.manager || u.programs.contains(&p.id)).cloned().collect()
+    }
 }
 
 /// The Windows computer name, used as the default device name.
@@ -218,5 +407,35 @@ mod tests {
         assert!(matches!(s.unlock("t1", "1111"), Unlock::Relink));
         assert!(s.get("t1").unwrap().sealed.is_none());
         assert!(matches!(s.unlock("t1", "4321"), Unlock::Relink));
+    }
+
+    #[test]
+    fn studio_users_and_programmes() {
+        let mut s = Store::default();
+        let progs = |ids: &[i64]| ids.iter().map(|&id| crate::audioshare::api::Program { id, name: format!("P{id}"), ..Default::default() }).collect::<Vec<_>>();
+        s.profiles.push(Profile { id: "st".into(), display_name: "Studio 2".into(), account_type: "studio".into(), programs: progs(&[1, 2, 3]), ..Default::default() });
+        let m = s.new_local_user("Anne", "1234", Vec::new(), true).unwrap();
+        let k = s.new_local_user("Kees", "5678", vec![2, 9], false).unwrap();
+        s.local_users.push(m.clone());
+        s.local_users.push(k.clone());
+        assert!(s.studio().is_some());
+        // manager: all studio programmes; Kees: only 2 (9 is not in the studio's list)
+        assert_eq!(s.programs_for(&m.id).iter().map(|p| p.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(s.programs_for(&k.id).iter().map(|p| p.id).collect::<Vec<_>>(), vec![2]);
+        assert!(s.new_local_user("kees", "1111", Vec::new(), false).is_err());
+        assert!(s.new_local_user("Piet", "12", Vec::new(), false).is_err());
+        // PIN check with lockout, no save to the real file needed for the check itself
+        let id = k.id.clone();
+        let check = |s: &mut Store, pin: &str| {
+            let t = now();
+            let u = s.local_users.iter_mut().find(|u| u.id == id).unwrap();
+            if u.locked_until > t { return "locked"; }
+            if u.pin.as_ref().and_then(|x| secure::open(x, pin)).as_deref() == Some(PIN_CHECK) { "ok" } else { "wrong" }
+        };
+        assert_eq!(check(&mut s, "5678"), "ok");
+        assert_eq!(check(&mut s, "0000"), "wrong");
+        // the last manager can't lose the role
+        let others_manage = s.local_users.iter().any(|u| u.id != m.id && u.manager);
+        assert!(!others_manage);
     }
 }

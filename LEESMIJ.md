@@ -1,4 +1,4 @@
-# StudioRecorder 0.7.0
+# StudioRecorder 0.8.0
 
 Eenvoudige opname-app voor de radiostudio: opnemen met live waveform en VU-meter, daarna begin en eind trimmen, foutjes eruit knippen, exporteren naar FLAC, WAV of MP3 en aanleveren bij AudioShare.
 
@@ -100,6 +100,24 @@ Downloaden gaat via AudioShare → *Recorders*; je koppelingen en instellingen i
 - Geen verbinding? De recorder probeert het opnieuw na 10 s, 30 s, 1 min en daarna elke 5 minuten, ook na een herstart.
 - Staat er al een eigen aflevering op die datum, dan vraagt de recorder of je wilt vervangen, met een waarschuwing als een station de oude al heeft gedownload. Van een andere maker kun je niets vervangen.
 - Uur 1 en uur 2 zijn aparte opnames met elk hun eigen programma.
+
+## Studio (vaste studio-pc, vanaf 0.8.0)
+
+Op een studio-pc waar verschillende technici en makers werken, koppel je de **pc als studio** in plaats van iedere persoon apart.
+
+1. De admin maakt in AudioShare onder *Recorders → Studio's* een studio aan (bijv. "Studio 2") en vinkt aan welke programma's die studio mag aanleveren.
+2. De admin klikt op **Recorder downloaden** en geeft de zip aan de studiobeheerder.
+3. De studiobeheerder pakt de zip uit op de studio-pc en start de recorder. Het koppelscherm vraagt de **naam en beheerpincode van de studiobeheerder**.
+4. Onder **Instellingen → AudioShare → Gebruikers** maakt de studiobeheerder de technici en makers aan: naam, pincode en welke programma's (uit de lijst van de studio) ieder mag uploaden.
+
+Daarna:
+- Bij het starten is niemand ingelogd. **Inloggen**: kies je naam en vul je pincode in. Je ziet alleen je eigen programma's.
+- Bij elke upload gaat je naam mee als **bediend door**; die staat in AudioShare bij de aflevering.
+- De koppeling met AudioShare hoort bij de studio, niet bij een persoon. Het token staat in Windows Credential Manager, dus uploads in de wachtrij gaan door, ook als iedereen is uitgelogd of de recorder opnieuw is gestart.
+- Alleen een studiobeheerder mag de instellingen, de invoer en de gebruikers wijzigen, en ziet alle uploads. Een gewone gebruiker ziet alleen zijn eigen uploads.
+- 5 foute pincodes: 5 minuten wachten. Pincode vergeten: de studiobeheerder stelt een nieuwe in (Gebruiker → Wijzigen).
+- Haalt de admin in AudioShare een programma bij de studio weg, dan verdwijnt het ook bij de gebruikers.
+- Studio opnieuw koppelen (nieuwe code van de admin): gebruikers en instellingen blijven behouden.
 
 ## Inloggen en uitloggen
 

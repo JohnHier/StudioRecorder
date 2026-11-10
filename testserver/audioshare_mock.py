@@ -210,7 +210,8 @@ class H(BaseHTTPRequestHandler):
             SEQ["draft"] += 1
             d = {"id": SEQ["draft"], "kind": "new", "program_id": pid, "episode_id": None, "owner": u["id"],
                  "client_upload_id": b.get("client_upload_id"), "broadcast_date": b["broadcast_date"],
-                 "title": b["title"], "description": b.get("description", ""), "parts": {1: None}, "finalized": None}
+                 "title": b["title"], "description": b.get("description", ""), "parts": {1: None}, "finalized": None,
+                 "operator": b.get("operator")}
             DRAFTS[d["id"]] = d
             return 201, self.draft_view(d)
 
@@ -303,7 +304,7 @@ class H(BaseHTTPRequestHandler):
     def draft_view(d):
         return {"draft_id": d["id"], "kind": d["kind"], "program_id": d["program_id"], "episode_id": d["episode_id"],
                 "status": "draft", "broadcast_date": d["broadcast_date"], "title": d["title"],
-                "client_upload_id": d["client_upload_id"],
+                "client_upload_id": d["client_upload_id"], "operator": d.get("operator"),
                 "parts": [{"nr": k, "status": "uploaded" if v else "missing"} for k, v in d["parts"].items()]}
 
 
