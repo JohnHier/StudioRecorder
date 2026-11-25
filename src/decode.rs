@@ -22,7 +22,7 @@ pub fn needs_decoding(p: &Path) -> bool {
     matches!(extension(p).as_str(), "mp3" | "flac")
 }
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     std::env::temp_dir().join(crate::edition::app_name())
 }
 

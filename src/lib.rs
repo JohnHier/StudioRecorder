@@ -4,6 +4,7 @@
 mod app;
 pub mod audioshare;
 pub mod decode;
+pub mod denoise;
 pub mod edition;
 pub mod engine;
 pub mod export;

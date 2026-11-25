@@ -32,7 +32,7 @@ pub fn version() -> &'static str {
     }
 }
 
-pub const ARCHIEF_VERSION: &str = "1.0.0";
+pub const ARCHIEF_VERSION: &str = "1.1.0";
 
 /// Program name, also used for the settings folder (%APPDATA%\<name>).
 pub fn app_name() -> &'static str {

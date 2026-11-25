@@ -35,6 +35,14 @@ pub struct Settings {
     /// ArchiefRecorder: peak limiter.
     pub limiter_on: bool,
     pub limiter: crate::level::LimiterParams,
+    /// ArchiefRecorder: stop recording automatically after this many minutes (0 = off).
+    pub auto_stop_min: u32,
+    /// ... and/or after this many seconds of silence (tape hiss counts as silence).
+    pub auto_stop_silence: bool,
+    pub auto_stop_silence_s: u32,
+    /// ArchiefRecorder: voice isolation (DeepFilterNet).
+    pub isolate_on: bool,
+    pub isolate: crate::denoise::Strength,
 }
 
 impl Default for Settings {
@@ -56,6 +64,11 @@ impl Default for Settings {
             level: Default::default(),
             limiter_on: crate::edition::archive(),
             limiter: Default::default(),
+            auto_stop_min: 0,
+            auto_stop_silence: crate::edition::archive(),
+            auto_stop_silence_s: 30,
+            isolate_on: false,
+            isolate: crate::denoise::Strength::Medium,
         }
     }
 }

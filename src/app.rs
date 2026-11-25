@@ -820,6 +820,65 @@ impl Meter {
 // ---------------------------------------------------------------------------
 
 /// Crossfade at every cut in the exported file.
+/// ArchiefRecorder: stop now? On time (minutes recorded) or after a silence,
+/// the silence only once there has been sound.
+fn auto_stop_reason(s: &Settings, rate: u64, frames: u64, last_sound_frame: u64, quiet: Duration) -> Option<String> {
+    let silence = s.auto_stop_silence_s.max(5) as u64;
+    if s.auto_stop_min > 0 && frames >= s.auto_stop_min as u64 * 60 * rate {
+        Some(format!("Automatisch gestopt na {} minuten", s.auto_stop_min))
+    } else if s.auto_stop_silence && last_sound_frame > 0 && quiet >= Duration::from_secs(silence) {
+        Some(format!("Automatisch gestopt: {silence} seconden stilte (einde bandje)"))
+    } else {
+        None
+    }
+}
+
+/// UIT point 2 s after the last sound, if that leaves a real empty end to drop.
+fn out_after_last_sound(frames: u64, last_sound_frame: u64, rate: u64) -> Option<u64> {
+    let end = (last_sound_frame + 2 * rate).min(frames);
+    (last_sound_frame > 0 && frames > end + rate / 2).then_some(end)
+}
+
+#[cfg(test)]
+mod auto_stop_tests {
+    use super::*;
+
+    fn st(min: u32, silence: bool, secs: u32) -> Settings {
+        Settings { auto_stop_min: min, auto_stop_silence: silence, auto_stop_silence_s: secs, ..Default::default() }
+    }
+    const R: u64 = 48_000;
+
+    #[test]
+    fn stops_on_time() {
+        let s = st(46, false, 30); // C90
+        assert!(auto_stop_reason(&s, R, 45 * 60 * R, 45 * 60 * R, Duration::ZERO).is_none());
+        assert!(auto_stop_reason(&s, R, 46 * 60 * R, 46 * 60 * R, Duration::ZERO).unwrap().contains("46 minuten"));
+        assert!(auto_stop_reason(&st(0, false, 30), R, 999 * 60 * R, 0, Duration::from_secs(999)).is_none(), "all off");
+    }
+
+    #[test]
+    fn stops_on_silence_only_after_sound() {
+        let s = st(0, true, 30);
+        // not yet any sound (deck not started): keep waiting
+        assert!(auto_stop_reason(&s, R, 120 * R, 0, Duration::from_secs(120)).is_none());
+        // sound, then 29 s of silence: not yet
+        assert!(auto_stop_reason(&s, R, 600 * R, 571 * R, Duration::from_secs(29)).is_none());
+        // 30 s: stop
+        assert!(auto_stop_reason(&s, R, 601 * R, 571 * R, Duration::from_secs(30)).unwrap().contains("30 seconden"));
+        // whatever comes first: time
+        assert!(auto_stop_reason(&st(31, true, 30), R, 31 * 60 * R, 31 * 60 * R, Duration::ZERO).unwrap().contains("minuten"));
+    }
+
+    #[test]
+    fn out_point_after_last_sound() {
+        // last sound at 30:00, stopped at 30:31 → UIT at 30:02
+        assert_eq!(out_after_last_sound(1831 * R, 1800 * R, R), Some(1802 * R));
+        // stopped right after the sound: nothing to trim
+        assert_eq!(out_after_last_sound(1802 * R, 1800 * R, R), None);
+        assert_eq!(out_after_last_sound(100 * R, 0, R), None);
+    }
+}
+
 /// Export format buttons. ArchiefRecorder also offers MP3 192k.
 fn format_choice(ui: &mut egui::Ui, settings: &mut Settings) -> bool {
     let mut changed = false;
@@ -968,6 +1027,19 @@ struct Editor {
     curve_params: Option<LevelParams>,
     /// Listen to the original instead of the leveled sound (A/B).
     listen_original: bool,
+    /// The audio without voice isolation (and its overview), to switch back.
+    raw_path: PathBuf,
+    raw_peaks: Option<Peaks>,
+    /// Voice isolation now in use, and the job making a cleaned copy.
+    iso: Option<crate::denoise::Strength>,
+    iso_job: Option<IsoJob>,
+}
+
+struct IsoJob {
+    strength: crate::denoise::Strength,
+    progress: Arc<AtomicU32>,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<Result<(PathBuf, Peaks), String>>,
 }
 
 impl Editor {
@@ -975,6 +1047,10 @@ impl Editor {
         let stem = origin.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         Editor {
             reader: WavReader::open(&path).ok(),
+            raw_path: path.clone(),
+            raw_peaks: None,
+            iso: None,
+            iso_job: None,
             path,
             origin,
             fmt,
@@ -1016,6 +1092,75 @@ impl Editor {
             let _ = tx.send(res);
         });
         self.analyzing = Some((progress, rx));
+    }
+
+    /// Use another audio file for the same timeline (cleaned copy or back to the raw one).
+    fn set_audio(&mut self, path: PathBuf, peaks: Peaks) {
+        self.reader = WavReader::open(&path).ok();
+        self.path = path;
+        self.peaks = peaks;
+        self.cache = None;
+        self.analysis = None;
+        self.loudness = None;
+        self.curve = None;
+        self.curve_params = None;
+        self.start_analysis();
+    }
+
+    /// Keep voice isolation in step with the settings: start a job, or switch back.
+    fn update_isolation(&mut self, on: bool, strength: crate::denoise::Strength) {
+        let want = on.then_some(strength);
+        if self.iso == want {
+            if let Some(j) = self.iso_job.take() {
+                j.cancel.store(true, Ordering::Relaxed);
+            }
+            return;
+        }
+        match want {
+            None => {
+                if let Some(j) = self.iso_job.take() {
+                    j.cancel.store(true, Ordering::Relaxed);
+                }
+                if let Some(p) = self.raw_peaks.take() {
+                    self.set_audio(self.raw_path.clone(), p);
+                }
+                self.iso = None;
+            }
+            Some(st) => {
+                if self.iso_job.as_ref().is_some_and(|j| j.strength == st) {
+                    return;
+                }
+                if let Some(j) = self.iso_job.take() {
+                    j.cancel.store(true, Ordering::Relaxed);
+                }
+                let progress = Arc::new(AtomicU32::new(0));
+                let cancel = Arc::new(AtomicBool::new(false));
+                let (tx, rx) = crossbeam_channel::bounded(1);
+                let (src, pr, ca) = (self.raw_path.clone(), progress.clone(), cancel.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::denoise::cleaned(&src, st, &pr, &ca));
+                });
+                self.iso_job = Some(IsoJob { strength: st, progress, cancel, rx });
+            }
+        }
+    }
+
+    /// Pick up a finished isolation job. Returns an error message for the user.
+    fn poll_isolation(&mut self) -> Option<String> {
+        let res = self.iso_job.as_ref()?.rx.try_recv().ok()?;
+        let job = self.iso_job.take()?;
+        match res {
+            Ok((path, peaks)) => {
+                if self.raw_peaks.is_none() {
+                    self.raw_peaks = Some(self.peaks.clone());
+                }
+                self.set_audio(path, peaks);
+                self.iso = Some(job.strength);
+                None
+            }
+            Err(e) if e == "Geannuleerd" => None,
+            Err(e) => Some(e),
+        }
     }
 
     /// Pick up a finished analysis and keep the gain curve in step with the settings.
@@ -1453,9 +1598,69 @@ impl App {
                     ui.set_width(w);
                     ui.set_min_height(96.0);
                     if crate::edition::archive() {
-                        ui.label(egui::RichText::new("Opnemen voor het archief").size(14.0).strong());
+                        ui.label(egui::RichText::new("Automatisch stoppen").size(14.0).strong());
                         ui.add_space(4.0);
-                        hint_line(ui, "Neem een hele kant van de cassette of band in één keer op. Daarna knip je bij Bewerken de stukken eruit, stel je het volume in en exporteer je.");
+                        let mut changed = false;
+                        ui.horizontal_wrapped(|ui| {
+                            for (min, label, tip) in [
+                                (0u32, "Uit", "Niet stoppen op tijd"),
+                                (31, "C60", "Cassette van 60 minuten: 30 minuten per kant (+1 minuut speling)"),
+                                (46, "C90", "Cassette van 90 minuten: 45 minuten per kant (+1 minuut speling)"),
+                                (61, "C120", "Cassette van 120 minuten: 60 minuten per kant (+1 minuut speling)"),
+                            ] {
+                                changed |= ui.selectable_value(&mut self.settings.auto_stop_min, min, label).on_hover_text(tip).changed();
+                            }
+                            ui.add_space(6.0);
+                            let mut m = self.settings.auto_stop_min;
+                            if ui.add(egui::DragValue::new(&mut m).range(0..=240).suffix(" min")).on_hover_text("Eigen aantal minuten (0 = uit)").changed() {
+                                self.settings.auto_stop_min = m;
+                                changed = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .checkbox(&mut self.settings.auto_stop_silence, "Of na")
+                                .on_hover_text("Stopt als er zo lang alleen stilte of bandruis is: het bandje is op. Pas nadat er geluid is geweest.")
+                                .changed();
+                            let mut sec = self.settings.auto_stop_silence_s;
+                            if ui.add_enabled(self.settings.auto_stop_silence, egui::DragValue::new(&mut sec).range(5..=300).suffix(" s")).changed() {
+                                self.settings.auto_stop_silence_s = sec;
+                                changed = true;
+                            }
+                            ui.label(egui::RichText::new("stilte (einde bandje)").color(DIM));
+                        });
+                        if changed {
+                            self.settings.save();
+                        }
+                        // while recording: what will happen
+                        if let (true, Some(e)) = (self.is_recording(), &self.engine) {
+                            let rate = e.shared.sample_rate.max(1) as u64;
+                            let secs = e.shared.rec_frames.load(Ordering::Relaxed) / rate;
+                            let mut parts = Vec::new();
+                            if self.settings.auto_stop_min > 0 {
+                                let left = (self.settings.auto_stop_min as u64 * 60).saturating_sub(secs);
+                                parts.push(format!("over {}:{:02}", left / 60, left % 60));
+                            }
+                            if self.settings.auto_stop_silence {
+                                let ls = e.shared.last_sound_frame.load(Ordering::Relaxed);
+                                let heard = ls > 0;
+                                let quiet = e.shared.rec_frames.load(Ordering::Relaxed).saturating_sub(ls) / rate;
+                                parts.push(if !heard {
+                                    "na stilte (wacht op geluid)".to_string()
+                                } else if quiet >= 3 {
+                                    format!("na stilte ({quiet} van {} s)", self.settings.auto_stop_silence_s)
+                                } else {
+                                    format!("na {} s stilte", self.settings.auto_stop_silence_s)
+                                });
+                            }
+                            if !parts.is_empty() {
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(format!("Stopt automatisch {}", parts.join(" of "))).color(AMBER));
+                            }
+                        } else {
+                            ui.add_space(2.0);
+                            hint_line(ui, "Neem een hele kant in één keer op. Daarna knip je bij Bewerken, stel je het volume in en exporteer je.");
+                        }
                         return;
                     }
                     if !self.aus.configured() {
@@ -1612,6 +1817,35 @@ impl App {
         });
     }
 
+    /// ArchiefRecorder: stop by itself at the end of the tape (time or silence).
+    fn check_auto_stop(&mut self, ctx: &egui::Context) {
+        if !crate::edition::archive() || !self.is_recording() {
+            return;
+        }
+        let Some(e) = &self.engine else { return };
+        if e.is_paused() {
+            return;
+        }
+        let rate = e.shared.sample_rate.max(1) as u64;
+        let frames = e.shared.rec_frames.load(Ordering::Relaxed);
+        let last_sound = e.shared.last_sound_frame.load(Ordering::Relaxed);
+        // silence measured in recorded audio, not on the clock
+        let quiet = Duration::from_secs_f64(frames.saturating_sub(last_sound) as f64 / rate as f64);
+        let Some(reason) = auto_stop_reason(&self.settings, rate, frames, last_sound, quiet) else { return };
+        self.confirm_stop = false;
+        if self.mini {
+            self.set_mini(ctx, false);
+        }
+        self.stop_recording();
+        // UIT just after the last sound, so the empty end is already gone
+        if let Some(ed) = self.editor.as_mut() {
+            if let Some(end) = out_after_last_sound(ed.frames, last_sound, rate) {
+                ed.out_pt = end;
+            }
+        }
+        self.toast(reason, false);
+    }
+
     fn stop_recording(&mut self) {
         let Some(engine) = &self.engine else { return };
         let res = engine.stop_recording();
@@ -1680,6 +1914,10 @@ impl App {
         let missing = if uploading { ed.meta.missing() } else { Vec::new() };
         if !missing.is_empty() {
             self.export_result = Some(Err(format!("Vul voor het uploaden eerst in: {} (of zet uploaden uit)", missing.join(", "))));
+            return;
+        }
+        if crate::edition::archive() && ed.iso_job.is_some() {
+            self.export_result = Some(Err("De stemisolatie is nog bezig — even wachten".into()));
             return;
         }
         if crate::edition::archive() && self.settings.level_on && ed.curve.is_none() {
@@ -1815,8 +2053,20 @@ impl App {
         }
         if crate::edition::archive() {
             let params = self.settings.level;
-            if let Some(err) = self.editor.as_mut().and_then(|e| e.update_leveler(&params)) {
-                self.toast(err, true);
+            let (iso_on, iso_st) = (self.settings.isolate_on, self.settings.isolate);
+            let mut errs = Vec::new();
+            if let Some(ed) = self.editor.as_mut() {
+                ed.update_isolation(iso_on, iso_st);
+                if let Some(e) = ed.poll_isolation() {
+                    errs.push(format!("Stemisolatie: {e}"));
+                    self.settings.isolate_on = false;
+                }
+                if let Some(e) = ed.update_leveler(&params) {
+                    errs.push(e);
+                }
+            }
+            for e in errs {
+                self.toast(e, true);
             }
         }
         self.player.tick();
@@ -2307,7 +2557,7 @@ impl App {
         // Main waveform
         let avail = ui.available_size();
         // room below the waveform for the controls (ArchiefRecorder: also the volume panel)
-        let reserve = if crate::edition::archive() { if self.settings.level_on || self.settings.limiter_on { 545.0 } else { 505.0 } } else { 500.0 };
+        let reserve = if crate::edition::archive() { if self.settings.level_on || self.settings.limiter_on { 575.0 } else { 535.0 } } else { 500.0 };
         let wave_h = (avail.y - reserve).clamp(100.0, 520.0);
         let (outer, resp) = ui.allocate_exact_size(vec2(avail.x, wave_h), Sense::click_and_drag());
         let p = ui.painter_at(outer);
@@ -2842,6 +3092,30 @@ impl App {
             egui::Frame::NONE.fill(PANEL).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Ruis").strong().color(TEXT));
+                    ui.add_space(22.0);
+                    changed |= ui
+                        .checkbox(&mut self.settings.isolate_on, "Ruis verwijderen (AI-stemisolatie)")
+                        .on_hover_text("DeepFilterNet3: houdt de stem over en haalt bandruis, brom en geknister weg. Bedoeld voor spraak (interviews); muziek kan er vreemd van gaan klinken.")
+                        .changed();
+                    ui.add_space(8.0);
+                    ui.add_enabled_ui(self.settings.isolate_on, |ui| {
+                        for st in [crate::denoise::Strength::Light, crate::denoise::Strength::Medium, crate::denoise::Strength::Strong] {
+                            changed |= ui.selectable_value(&mut self.settings.isolate, st, st.label()).on_hover_text(st.hint()).changed();
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(j) = &ed.iso_job {
+                            let v = j.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+                            ui.add(egui::ProgressBar::new(v).desired_width(140.0).show_percentage());
+                            ui.label(egui::RichText::new("Stem isoleren").color(DIM));
+                        } else if let Some(st) = ed.iso {
+                            ui.label(egui::RichText::new(format!("Stemisolatie actief ({})", st.label().to_lowercase())).color(GREEN));
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Volume").strong().color(TEXT));
                     ui.add_space(10.0);
                     changed |= ui
@@ -2901,20 +3175,20 @@ impl App {
                 }
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
-                    let active = self.settings.level_on || self.settings.limiter_on;
+                    let active = self.settings.level_on || self.settings.limiter_on || ed.iso.is_some();
                     if active {
                         if ui
                             .checkbox(&mut ed.listen_original, "Beluister origineel")
-                            .on_hover_text("Vergelijk: afspelen zonder leveler en piekbegrenzer")
+                            .on_hover_text("Vergelijk: afspelen zonder ruisverwijdering, leveler en piekbegrenzer")
                             .changed()
                         {
                             restart = true;
                         }
                         ui.label(
                             egui::RichText::new(if ed.listen_original {
-                                "Afspelen klinkt nu zonder bewerking."
+                                "Afspelen klinkt nu als de originele opname."
                             } else {
-                                "Afspelen klinkt nu zoals de export: met leveler en piekbegrenzer."
+                                "Afspelen klinkt nu zoals de export."
                             })
                             .color(DIM),
                         );
@@ -3149,7 +3423,8 @@ impl App {
             self.player.stop();
         }
         if let Some(segs) = play_req {
-            let path = self.editor.as_ref().unwrap().path.clone();
+            let ed = self.editor.as_ref().unwrap();
+            let path = if ed.listen_original { ed.raw_path.clone() } else { ed.path.clone() };
             let plan = self.level_plan(true);
             self.player.play_leveled(&path, &segs, output_id.as_deref(), plan);
             if let Some(err) = self.player.error.clone() {
@@ -3396,6 +3671,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_background();
+        self.check_auto_stop(ctx);
 
         // Don't quit by accident during a recording.
         if ctx.input(|i| i.viewport().close_requested()) && self.is_recording() && !self.allow_quit {
@@ -3519,7 +3795,7 @@ impl eframe::App for App {
         self.confirm_dialogs(ctx);
         self.draw_toast(ctx);
 
-        let analysing = self.editor.as_ref().is_some_and(|e| e.analyzing.is_some());
+        let analysing = self.editor.as_ref().is_some_and(|e| e.analyzing.is_some() || e.iso_job.is_some());
         let busy = self.engine.is_some() || self.player.is_playing() || self.loading.is_some() || self.exporting.is_some() || analysing;
         if busy {
             ctx.request_repaint_after(Duration::from_millis(30));

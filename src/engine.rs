@@ -95,6 +95,10 @@ pub struct Shared {
     pub error: Mutex<Option<String>>,
     pub write_error: Mutex<Option<String>>,
     pub last_signal: Mutex<Instant>,
+    /// Last moment with sound (average level above about −48 dBFS, so tape hiss
+    /// counts as silence), and the recorded frame at that moment (0 = none yet).
+    pub last_sound: Mutex<Instant>,
+    pub last_sound_frame: AtomicU64,
 }
 
 impl Shared {
@@ -120,6 +124,13 @@ impl Shared {
 enum Cmd {
     Start(PathBuf, Sender<Result<(), String>>),
     Stop(Sender<RecResult>),
+}
+
+/// Sound or silence? Average level (RMS) above about −48 dBFS. Tape hiss stays
+/// under that (it has peaks, but a low average), a voice or music is above it.
+pub fn has_sound(block: &[f32]) -> bool {
+    let ms = block.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / block.len().max(1) as f64;
+    ms > 1.6e-5
 }
 
 pub struct RecResult {
@@ -247,6 +258,8 @@ fn new_shared(sample_rate: u32, channels: usize) -> Arc<Shared> {
         error: Mutex::new(None),
         write_error: Mutex::new(None),
         last_signal: Mutex::new(Instant::now()),
+        last_sound: Mutex::new(Instant::now()),
+        last_sound_frame: AtomicU64::new(0),
     })
 }
 
@@ -381,6 +394,10 @@ fn worker(rx: Receiver<Vec<f32>>, cmd: Receiver<Cmd>, shared: Arc<Shared>, chann
                                 *p = Peaks::new(channels, shared.sample_rate);
                             }
                             shared.rec_frames.store(0, Ordering::Relaxed);
+                            shared.last_sound_frame.store(0, Ordering::Relaxed);
+                            if let Ok(mut t) = shared.last_sound.lock() {
+                                *t = Instant::now();
+                            }
                             shared.dropouts.store(0, Ordering::Relaxed);
                             *shared.write_error.lock().unwrap() = None;
                             shared.paused.store(false, Ordering::Relaxed);
@@ -426,6 +443,16 @@ fn worker(rx: Receiver<Vec<f32>>, cmd: Receiver<Cmd>, shared: Arc<Shared>, chann
                 if any {
                     if let Ok(mut t) = shared.last_signal.lock() {
                         *t = Instant::now();
+                    }
+                }
+                // average level of this block: sound or (tape) silence?
+                if has_sound(&chunk) {
+                    if let Ok(mut t) = shared.last_sound.lock() {
+                        *t = Instant::now();
+                    }
+                    if shared.recording.load(Ordering::Relaxed) && !shared.paused.load(Ordering::Relaxed) {
+                        let f = shared.rec_frames.load(Ordering::Relaxed) + (chunk.len() / channels.max(1)) as u64;
+                        shared.last_sound_frame.store(f, Ordering::Relaxed);
                     }
                 }
                 let paused = shared.paused.load(Ordering::Relaxed);
@@ -520,3 +547,28 @@ pub fn keep_awake(on: bool) {
 
 #[cfg(not(windows))]
 pub fn keep_awake(_on: bool) {}
+
+#[cfg(test)]
+mod sound_tests {
+    use super::has_sound;
+
+    fn noise(amp: f32, n: usize) -> Vec<f32> {
+        let mut seed = 5u32;
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 8) as f32 / 16_777_216.0 - 0.5) * 2.0 * amp
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hiss_is_silence_voice_is_sound() {
+        // tape hiss around −58 dBFS RMS, with peaks up to −47 dBFS
+        assert!(!has_sound(&noise(0.0045, 4800)));
+        assert!(!has_sound(&vec![0.0; 4800]));
+        // quiet speech around −35 dBFS RMS
+        let voice: Vec<f32> = (0..4800).map(|i| 0.025 * (i as f32 * 0.03).sin()).collect();
+        assert!(has_sound(&voice));
+    }
+}
