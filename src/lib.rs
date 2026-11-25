@@ -3,6 +3,8 @@
 
 mod app;
 pub mod audioshare;
+pub mod auto;
+mod auto_ui;
 pub mod decode;
 pub mod denoise;
 pub mod edition;

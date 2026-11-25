@@ -144,11 +144,59 @@ pub struct Engine {
     pub shared: Arc<Shared>,
     _stream: Option<cpal::Stream>,
     demo_stop: Option<Arc<AtomicBool>>,
-    cmd: Sender<Cmd>,
+    cmd: Arc<Sender<Cmd>>,
     worker: Option<JoinHandle<()>>,
 }
 
+/// A handle to start and stop recording from another thread (automatic mode).
+/// It only talks to the worker; the device itself stays with the Engine.
+/// Holds the command channel weakly: dropping the Engine is never held up by a handle.
+#[derive(Clone)]
+pub struct Handle {
+    cmd: std::sync::Weak<Sender<Cmd>>,
+    pub shared: Arc<Shared>,
+}
+
+impl Handle {
+    pub fn start_recording(&self, path: &Path) -> Result<(), String> {
+        let cmd = self.cmd.upgrade().ok_or("Invoerapparaat is gesloten")?;
+        start_on(&cmd, path)
+    }
+    pub fn stop_recording(&self) -> RecResult {
+        match self.cmd.upgrade() {
+            Some(cmd) => stop_on(&cmd),
+            None => RecResult { path: None, frames: 0, peaks: None, error: Some("Invoerapparaat is gesloten".into()) },
+        }
+    }
+    pub fn is_recording(&self) -> bool {
+        self.shared.recording.load(Ordering::Relaxed)
+    }
+}
+
+fn start_on(cmd: &Sender<Cmd>, path: &Path) -> Result<(), String> {
+    let (tx, rx) = bounded(1);
+    cmd.send(Cmd::Start(path.to_path_buf(), tx)).map_err(|_| "Audio-thread gestopt".to_string())?;
+    rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "Geen reactie van audio-thread".to_string())?
+}
+
+fn stop_on(cmd: &Sender<Cmd>) -> RecResult {
+    let (tx, rx) = bounded(1);
+    if cmd.send(Cmd::Stop(tx)).is_err() {
+        return RecResult { path: None, frames: 0, peaks: None, error: Some("Audio-thread gestopt".into()) };
+    }
+    rx.recv_timeout(Duration::from_secs(30)).unwrap_or(RecResult {
+        path: None,
+        frames: 0,
+        peaks: None,
+        error: Some("Opname kon niet netjes worden afgesloten".into()),
+    })
+}
+
 impl Engine {
+    pub fn handle(&self) -> Handle {
+        Handle { cmd: Arc::downgrade(&self.cmd), shared: self.shared.clone() }
+    }
+
     /// Open an input device and start monitoring levels.
     pub fn open(choice: &InputChoice) -> Result<Engine, String> {
         let (tx, rx) = bounded::<Vec<f32>>(4096);
@@ -162,7 +210,7 @@ impl Engine {
                 shared,
                 _stream: None,
                 demo_stop: Some(stop),
-                cmd,
+                cmd: Arc::new(cmd),
                 worker: Some(worker),
             });
         }
@@ -191,28 +239,17 @@ impl Engine {
             shared,
             _stream: Some(stream),
             demo_stop: None,
-            cmd,
+            cmd: Arc::new(cmd),
             worker: Some(worker),
         })
     }
 
     pub fn start_recording(&self, path: &Path) -> Result<(), String> {
-        let (tx, rx) = bounded(1);
-        self.cmd.send(Cmd::Start(path.to_path_buf(), tx)).map_err(|_| "Audio-thread gestopt".to_string())?;
-        rx.recv_timeout(Duration::from_secs(5)).map_err(|_| "Geen reactie van audio-thread".to_string())?
+        start_on(&self.cmd, path)
     }
 
     pub fn stop_recording(&self) -> RecResult {
-        let (tx, rx) = bounded(1);
-        if self.cmd.send(Cmd::Stop(tx)).is_err() {
-            return RecResult { path: None, frames: 0, peaks: None, error: Some("Audio-thread gestopt".into()) };
-        }
-        rx.recv_timeout(Duration::from_secs(30)).unwrap_or(RecResult {
-            path: None,
-            frames: 0,
-            peaks: None,
-            error: Some("Opname kon niet netjes worden afgesloten".into()),
-        })
+        stop_on(&self.cmd)
     }
 
     pub fn set_paused(&self, on: bool) {
@@ -238,7 +275,7 @@ impl Drop for Engine {
         }
         self._stream = None; // closes the device; the worker sees the channel close
         let (dummy, _) = unbounded();
-        self.cmd = dummy;
+        self.cmd = Arc::new(dummy);
         if let Some(w) = self.worker.take() {
             let _ = w.join();
         }

@@ -1,4 +1,4 @@
-# StudioRecorder 0.8.0
+# StudioRecorder 0.9.0
 
 Eenvoudige opname-app voor de radiostudio: opnemen met live waveform en VU-meter, daarna begin en eind trimmen, foutjes eruit knippen, exporteren naar FLAC, WAV of MP3 en aanleveren bij AudioShare.
 
@@ -119,6 +119,61 @@ Daarna:
 - Haalt de admin in AudioShare een programma bij de studio weg, dan verdwijnt het ook bij de gebruikers.
 - Studio opnieuw koppelen (nieuwe code van de admin): gebruikers en instellingen blijven behouden.
 
+## Automatische opname (vanaf 0.9.0)
+
+Een eigen script of planner start en stopt de opname via UDP. Er hoeft niemand bij de recorder te zitten of ingelogd te zijn.
+
+**Aanzetten** (alleen een beheerder): *Instellingen → Automatische opname → Instellen…* en vink **Automatische modus aan**.
+Op het opnamescherm staat dan een groene balk: *AUTOMATISCH — wacht op START (UDP 47820)*. Handmatig opnemen kan niet zolang de modus aan staat.
+
+**Commando's** (één per UDP-bericht, hoofdletters maken niet uit). De recorder antwoordt altijd naar de afzender:
+
+| Bericht | Antwoord |
+|---|---|
+| `START` | `OK RECORDING <programma>` of `ERR <CODE> …` |
+| `STOP` | `OK STOPPED 00:58:12` of `ERR NOT_RECORDING` |
+| `STATUS` | `OK RECORDING <programma> 00:12:03` of `OK IDLE` |
+
+Foutcodes: `ALREADY_RECORDING`, `NOT_RECORDING`, `UNKNOWN_PROGRAM`, `NO_INPUT`, `BAD_KEY`, `BAD_COMMAND`.
+Komt er geen STOP, dan stopt de opname zelf na de **maximale opnameduur** (standaard 60 minuten, instelbaar).
+
+**Verbinding**: poort (standaard 47820), toegestane afzenders (standaard alleen `127.0.0.1` = deze pc; `*` = iedereen)
+en een optionele sleutel. Met een sleutel moet elk bericht `key=<sleutel>` bevatten, bijv. `START key=geheim`.
+
+**Welk programma?** De recorder kijkt op volgorde (elk aan/uit te zetten):
+1. het bericht zelf: `START DeBlik1` (slug, naam of id uit AudioShare);
+2. het **weekrooster**: dagen, van–tot en programma. START mag 5 minuten vóór het begin; een blok over middernacht telt voor de dag waarop het begint;
+3. het **vaste programma**.
+Vindt hij niets, dan neemt hij niet op (`ERR UNKNOWN_PROGRAM`).
+
+**Na STOP, per programma**: *Alleen opslaan*, *Alleen uploaden* of *Opslaan + uploaden*.
+- Opslaan: in de gekozen map (standaard `<opnamemap>\Automatisch\<programma>`), als FLAC, WAV of MP3 320k.
+- Uploaden: als MP3 320k via de uploadwachtrij, met de koppeling van de studio. In AudioShare staat *bediend door: Automatisch*.
+  Kan alleen als de pc als studio is gekoppeld en het een AudioShare-programma van de studio is.
+- Uitzenddatum = de dag van de opname. Titel volgens een patroon (standaard `{programma} — {datum}`, ook `{tijd}` en `{week}`).
+  Omschrijving: die van de vorige aflevering uit AudioShare, of een vaste tekst. De bestandsnaam is de titel.
+- Staat er al een aflevering op die datum, dan wacht de upload op een bevestiging in het tabblad Uploads (er wordt niets automatisch vervangen).
+- Het originele 24-bit WAV-bestand blijft altijd in de opnamemap staan.
+
+Alles komt in het logboek (tabblad **Uploads**) onder *Automatisch*, ook genegeerde berichten van niet-toegestane afzenders.
+De automatische modus werkt ook als het venster geminimaliseerd is. Een automatische opname kun je met de rode knop stoppen; hij wordt dan verwerkt zoals bij STOP.
+
+Testen vanuit PowerShell op dezelfde pc:
+
+```powershell
+$u = New-Object System.Net.Sockets.UdpClient
+$b = [Text.Encoding]::UTF8.GetBytes("START"); $u.Send($b, $b.Length, "127.0.0.1", 47820)
+$b = [Text.Encoding]::UTF8.GetBytes("STOP");  $u.Send($b, $b.Length, "127.0.0.1", 47820)
+```
+
+Of met Python (toont ook het antwoord):
+
+```python
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(2)
+s.sendto(b"START", ("127.0.0.1", 47820)); print(s.recvfrom(1024)[0].decode())
+```
+
 ## Inloggen en uitloggen
 
 - Bij het starten is er **niemand ingelogd**. Dan kun je opnemen, een bestand openen, bewerken en opslaan (exporteren).
@@ -143,7 +198,7 @@ Ze worden per pc opgeslagen in `%APPDATA%\StudioRecorder\settings.json`, dus elk
 - Rust, met egui (interface), cpal (WASAPI-audio), flacenc (FLAC), LAME (MP3) en ureq + Windows-TLS (AudioShare).
 - Dezelfde broncode bouwt ook de **ArchiefRecorder** (`src/bin/archiefrecorder.rs`, zie `LEESMIJ-ArchiefRecorder.md`).
   De StudioRecorder werkt ongewijzigd: export, MP3 320k (stand *Best*), AudioShare en instellingen zijn gelijk aan 0.8.0.
-- `src/engine.rs`: invoer, meters en crashveilig wegschrijven · `src/wav.rs`: WAV/RF64 lezen en schrijven ·
+- `src/engine.rs`: invoer, meters en crashveilig wegschrijven · `src/auto.rs` + `src/auto_ui.rs`: automatische opname via UDP · `src/wav.rs`: WAV/RF64 lezen en schrijven ·
   `src/export.rs`: trimmen naar FLAC/WAV · `src/player.rs`: afspelen · `src/app.rs`: interface.
 - Bouwen op Windows: installeer Rust (rustup.rs) en voer `cargo build --release` uit in deze map.
 - Tests: `cargo test` (o.a. bit-exacte FLAC-export, herstel na een crash en de volledige AudioShare-flow).

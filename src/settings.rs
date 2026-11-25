@@ -43,6 +43,8 @@ pub struct Settings {
     /// ArchiefRecorder: voice isolation (DeepFilterNet).
     pub isolate_on: bool,
     pub isolate: crate::denoise::Strength,
+    /// StudioRecorder: automatische opname via UDP (START/STOP).
+    pub auto: crate::auto::AutoSettings,
 }
 
 impl Default for Settings {
@@ -69,6 +71,7 @@ impl Default for Settings {
             auto_stop_silence_s: 30,
             isolate_on: false,
             isolate: crate::denoise::Strength::Medium,
+            auto: Default::default(),
         }
     }
 }

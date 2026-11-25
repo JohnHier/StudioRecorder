@@ -1466,12 +1466,20 @@ pub struct App {
     meta_profile: Option<String>,
     /// JohnWorks logo (light version for the dark interface).
     logo: egui::TextureHandle,
+    /// Automatische opname via UDP (StudioRecorder).
+    auto: crate::auto::Auto,
+    auto_win: crate::auto_ui::AutoWindow,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext) -> App {
         setup_style(&cc.egui_ctx);
         let settings = Settings::load();
+        let aus = as_ui::AsUi::new();
+        let auto = {
+            let c = cc.egui_ctx.clone();
+            crate::auto::Auto::start(aus.queue.clone(), move || c.request_repaint())
+        };
         let mut app = App {
             settings,
             inputs: Vec::new(),
@@ -1497,7 +1505,9 @@ impl App {
             toast: None,
             free_bytes: None,
             free_checked: None,
-            aus: as_ui::AsUi::new(),
+            aus,
+            auto,
+            auto_win: Default::default(),
             ipc_rx: crate::ipc::listen(),
             title_shown: String::new(),
             last_job: None,
@@ -1508,6 +1518,7 @@ impl App {
                 cc.egui_ctx.load_texture("johnworks", img, egui::TextureOptions::LINEAR)
             },
         };
+        app.sync_auto();
         app.meter.reset();
         std::thread::spawn(crate::decode::clean_cache);
         app.refresh_devices();
@@ -1559,6 +1570,52 @@ impl App {
         self.engine.as_ref().is_some_and(|e| e.is_recording())
     }
 
+    /// Automatische modus aan (alleen StudioRecorder).
+    fn auto_on(&self) -> bool {
+        !crate::edition::archive() && self.settings.auto.enabled
+    }
+
+    /// Programma's voor de automatische modus: die van de studio (AudioShare), anders de lokale lijst.
+    fn auto_programs(&self) -> Vec<(crate::auto::ProgRef, String)> {
+        use crate::auto::ProgRef;
+        match self.aus.store.studio() {
+            Some(st) => st.programs.iter().map(|p| (ProgRef { id: Some(p.id), name: p.name.clone() }, p.name.clone())).collect(),
+            None => self.settings.programs.iter().map(|n| (ProgRef { id: None, name: n.clone() }, n.clone())).collect(),
+        }
+    }
+
+    /// Geef de controller de actuele invoer, instellingen en studiokoppeling.
+    fn sync_auto(&mut self) {
+        if crate::edition::archive() {
+            return;
+        }
+        let studio = self.aus.store.studio().map(|st| crate::auto::StudioLink {
+            profile_id: st.id.clone(),
+            profile_name: st.display_name.clone(),
+            url: st.url.clone(),
+            programs: st.programs.clone(),
+        });
+        let mut c = self.auto.ctx.lock().unwrap();
+        c.engine = self.engine.as_ref().map(|e| e.handle());
+        c.auto = self.settings.auto.clone();
+        c.record_folder = self.settings.record_folder.clone();
+        c.studio_name = self.settings.studio_name.clone();
+        c.fade_ms = self.settings.fade_ms;
+        c.local_programs = self.settings.programs.clone();
+        c.studio = studio;
+    }
+
+    /// Een automatische opname stoppen en wachten tot hij is afgesloten (bij afsluiten).
+    fn stop_auto_and_wait(&self) {
+        self.auto.request_stop();
+        for _ in 0..50 {
+            if self.auto.running().is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn toast(&mut self, msg: impl Into<String>, error: bool) {
         self.toast = Some((msg.into(), Instant::now(), error));
     }
@@ -1577,6 +1634,10 @@ impl App {
     }
 
     fn start_recording(&mut self) {
+        if self.auto_on() {
+            self.toast("De automatische modus staat aan: opnames starten via START (UDP). Zet hem uit bij Instellingen → Automatische opname.", true);
+            return;
+        }
         let Some(engine) = &self.engine else { return };
         let folder = PathBuf::from(&self.settings.record_folder);
         if let Err(e) = std::fs::create_dir_all(&folder) {
@@ -1602,6 +1663,9 @@ impl App {
     }
 
     fn toggle_pause(&mut self) {
+        if self.auto.running().is_some() {
+            return;
+        }
         let Some(e) = &self.engine else { return };
         if !e.is_recording() {
             return;
@@ -1938,6 +2002,12 @@ impl App {
     }
 
     fn stop_recording(&mut self) {
+        // Een automatische opname stopt via de controller (die exporteert en uploadt).
+        if self.auto.running().is_some() {
+            self.auto.request_stop();
+            self.toast("Automatische opname wordt gestopt en verwerkt", false);
+            return;
+        }
         let Some(engine) = &self.engine else { return };
         let res = engine.stop_recording();
         let (rate, channels) = (engine.shared.sample_rate, engine.shared.channels as u16);
@@ -2354,6 +2424,33 @@ impl App {
             ui.add_space(4.0);
         }
 
+        // Automatische modus
+        let auto_run = self.auto.running();
+        if self.auto_on() {
+            let st = self.auto.status.lock().unwrap().clone();
+            let (text, col) = crate::auto_ui::status_line(&self.settings.auto, &st);
+            egui::Frame::NONE
+                .fill(col.gamma_multiply(0.16))
+                .stroke(Stroke::new(1.0, col.gamma_multiply(0.8)))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(text).size(15.0).strong().color(col));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if self.aus.admin_unlocked() && ui.button("Instellen…").clicked() {
+                                self.auto_win.open = true;
+                            }
+                        });
+                    });
+                });
+            ui.add_space(6.0);
+        } else if auto_run.is_some() {
+            // Modus uitgezet tijdens een automatische opname: die loopt door tot STOP of de knop.
+            ui.label(egui::RichText::new("Automatische opname loopt nog (modus staat uit) — stop hem met de rode knop.").color(AMBER));
+        }
+
         // Timer + big button
         let (rate, frames) = self
             .engine
@@ -2365,7 +2462,7 @@ impl App {
         ui.horizontal_top(|ui| {
             let h = 120.0;
             let (rect, resp) = ui.allocate_exact_size(vec2(h, h), Sense::click());
-            let can = self.engine.is_some();
+            let can = self.engine.is_some() && (recording || !self.auto_on());
             let hovered = resp.hovered() && can;
             let p = ui.painter();
             let c = rect.center();
@@ -2380,7 +2477,13 @@ impl App {
                 p.circle_stroke(c, h * 0.5 - 1.0, Stroke::new(2.0, LINE));
                 p.circle_filled(c, h * 0.24, if can { RED } else { RED_DARK });
             }
-            let tip = if recording { "Opname stoppen" } else { "Opname starten" };
+            let tip = if recording {
+                "Opname stoppen"
+            } else if self.auto_on() {
+                "Automatische modus: opnames starten via START (UDP)"
+            } else {
+                "Opname starten"
+            };
             if can && resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
                 if recording {
                     self.confirm_stop = true;
@@ -2392,7 +2495,7 @@ impl App {
             ui.add_space(10.0);
             ui.vertical(|ui| {
                 ui.add_space(25.0);
-                if pause_button(ui, 70.0, recording, paused) {
+                if pause_button(ui, 70.0, recording && auto_run.is_none(), paused) {
                     self.toggle_pause();
                 }
             });
@@ -2418,7 +2521,7 @@ impl App {
                     .wrap_mode(egui::TextWrapMode::Extend),
                 );
                 if recording {
-                    if let Some(p) = &self.rec_path {
+                    if let Some(p) = auto_run.as_ref().map(|r| &r.path).or(self.rec_path.as_ref()) {
                         let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                         ui.add(egui::Label::new(egui::RichText::new(name).color(DIM).size(12.5)).truncate())
                             .on_hover_text(p.display().to_string());
@@ -3721,6 +3824,17 @@ impl App {
                 ui.add_space(8.0);
                 ui.separator();
                 if !crate::edition::archive() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Automatische opname").strong());
+                        ui.label(
+                            egui::RichText::new(if self.settings.auto.enabled { "aan" } else { "uit" })
+                                .color(if self.settings.auto.enabled { GREEN } else { DIM }),
+                        );
+                        if ui.button("Instellen…").clicked() {
+                            self.auto_win.open = true;
+                        }
+                    });
+                    ui.separator();
                     self.aus.settings_section(ui);
                 }
                 ui.separator();
@@ -3758,7 +3872,11 @@ impl App {
                 ui.set_width(380.0);
                 ui.label(egui::RichText::new("Opname stoppen?").size(18.0).strong());
                 ui.add_space(6.0);
-                ui.label("De opname wordt afgesloten en geopend om te trimmen.");
+                ui.label(if self.auto.running().is_some() {
+                    "Dit is een automatische opname. Hij wordt afgesloten en verwerkt zoals bij STOP."
+                } else {
+                    "De opname wordt afgesloten en geopend om te trimmen."
+                });
                 ui.add_space(12.0);
                 let mut res = None;
                 ui.horizontal(|ui| {
@@ -3802,7 +3920,11 @@ impl App {
             match m.inner {
                 Some(true) => {
                     self.confirm_quit = false;
-                    self.stop_recording();
+                    if self.auto.running().is_some() {
+                        self.stop_auto_and_wait();
+                    } else {
+                        self.stop_recording();
+                    }
                     self.allow_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -3816,6 +3938,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.sync_auto();
         self.poll_background();
         self.check_auto_stop(ctx);
 
@@ -3936,6 +4059,12 @@ impl eframe::App for App {
 
         self.settings_window(ctx);
         if !crate::edition::archive() {
+            let programs = self.auto_programs();
+            let linked = self.aus.store.studio().is_some();
+            let may = self.aus.admin_unlocked();
+            if crate::auto_ui::window(ctx, &mut self.auto_win, &mut self.settings.auto, &programs, linked, &self.settings.record_folder, may) {
+                self.settings.save();
+            }
             self.aus.windows(ctx);
         }
         self.confirm_dialogs(ctx);
@@ -3951,6 +4080,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.auto.running().is_some() {
+            self.stop_auto_and_wait();
+        }
         if self.is_recording() {
             self.stop_recording();
         }
