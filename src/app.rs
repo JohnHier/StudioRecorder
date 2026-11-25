@@ -2437,7 +2437,7 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(text).size(15.0).strong().color(col));
+                        ui.label(egui::RichText::new(text).size(15.0).strong().color(col)).on_hover_text(crate::auto_ui::hint());
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if self.aus.admin_unlocked() && ui.button("Instellen…").clicked() {
                                 self.auto_win.open = true;
@@ -4062,7 +4062,8 @@ impl eframe::App for App {
             let programs = self.auto_programs();
             let linked = self.aus.store.studio().is_some();
             let may = self.aus.admin_unlocked();
-            if crate::auto_ui::window(ctx, &mut self.auto_win, &mut self.settings.auto, &programs, linked, &self.settings.record_folder, may) {
+            let log = if self.auto_win.open { self.aus.queue.data.lock().unwrap().log.clone() } else { Vec::new() };
+            if crate::auto_ui::window(ctx, &mut self.auto_win, &mut self.settings.auto, &programs, linked, &self.settings.record_folder, may, &log) {
                 self.settings.save();
             }
             self.aus.windows(ctx);

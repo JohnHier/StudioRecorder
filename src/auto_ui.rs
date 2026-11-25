@@ -1,5 +1,6 @@
 //! Venster "Automatische opname" (StudioRecorder 0.9.0).
 
+use crate::audioshare::queue::{Level, LogEntry};
 use crate::auto::{AfterStop, AutoSettings, ProgAuto, ProgRef, Slot, Status};
 use crate::export::ExportFormat;
 use eframe::egui::{self, Align2, Color32, RichText, vec2};
@@ -85,6 +86,11 @@ pub fn status_line(s: &AutoSettings, st: &Status) -> (String, Color32) {
     (t, if st.last.as_ref().is_some_and(|l| l.1) { AMBER } else { GREEN })
 }
 
+/// Uitleg bij de balk: waar het logboek staat.
+pub fn hint() -> &'static str {
+    "Details staan in het logboek: Instellen… → Logboek"
+}
+
 /// Het instellingenvenster. Geeft true terug als er iets is gewijzigd.
 pub fn window(
     ctx: &egui::Context,
@@ -94,6 +100,7 @@ pub fn window(
     studio_linked: bool,
     record_folder: &str,
     may_edit: bool,
+    log: &[LogEntry],
 ) -> bool {
     if !w.open {
         w.loaded = false;
@@ -162,7 +169,7 @@ pub fn window(
                 if s.use_schedule {
                     ui.indent("sched", |ui| {
                         let mut remove = None;
-                        egui::Grid::new("auto_sched").num_columns(4).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
+                        egui::Grid::new("auto_sched").num_columns(4).min_col_width(140.0).spacing(vec2(10.0, 6.0)).show(ui, |ui| {
                             for (i, slot) in s.schedule.iter_mut().enumerate() {
                                 ui.horizontal(|ui| {
                                     for (d, name) in DAYS.iter().enumerate() {
@@ -176,9 +183,9 @@ pub fn window(
                                     }
                                 });
                                 ui.horizontal(|ui| {
-                                    changed |= ui.add(egui::TextEdit::singleline(&mut slot.from).desired_width(54.0)).changed();
+                                    changed |= ui.add(egui::TextEdit::singleline(&mut slot.from).desired_width(54.0).char_limit(5).clip_text(false)).changed();
                                     ui.label("–");
-                                    changed |= ui.add(egui::TextEdit::singleline(&mut slot.to).desired_width(54.0)).changed();
+                                    changed |= ui.add(egui::TextEdit::singleline(&mut slot.to).desired_width(54.0).char_limit(5).clip_text(false)).changed();
                                 });
                                 changed |= prog_combo(ui, ("slot", i), programs, &mut slot.program, 220.0);
                                 if ui.small_button("verwijderen").clicked() {
@@ -217,7 +224,7 @@ pub fn window(
                 for (r, name) in programs {
                     let key = r.key();
                     let mut pa: ProgAuto = s.programs.get(&key).cloned().unwrap_or_default();
-                    let before = format!("{:?}", (&pa.after_stop, &pa.folder, pa.save_format, &pa.title_pattern, pa.previous_description, &pa.description));
+                    let before = format!("{:?}", (&pa.after_stop, &pa.folder, pa.save_format, &pa.title_pattern, pa.previous_description, &pa.description, &pa.file_pattern, pa.overwrite));
                     egui::CollapsingHeader::new(RichText::new(name).strong()).id_salt(("prog", &key)).show(ui, |ui| {
                         egui::Grid::new(("pg", &key)).num_columns(2).spacing(vec2(14.0, 6.0)).show(ui, |ui| {
                             ui.label("Na STOP");
@@ -251,6 +258,16 @@ pub fn window(
                                 ui.label("Formaat opslaan");
                                 format_combo(ui, ("fmt", &key), &mut pa.save_format);
                                 ui.end_row();
+                                ui.label("Bestandsnaam");
+                                ui.vertical(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut pa.file_pattern).desired_width(300.0).hint_text("leeg = de titel"));
+                                    ui.label(RichText::new("Vaste naam (bijv. testprogramma) of met {programma}, {datum}, {tijd}, {week}").size(11.5).color(DIM));
+                                    ui.checkbox(&mut pa.overwrite, "Bestaand bestand met dezelfde naam overschrijven");
+                                    if !pa.overwrite {
+                                        ui.label(RichText::new("Uit: bestaat de naam al, dan komt er (2), (3) … achter.").size(11.5).color(DIM));
+                                    }
+                                });
+                                ui.end_row();
                             }
                             if pa.after_stop.uploads() {
                                 ui.label("Upload");
@@ -273,12 +290,32 @@ pub fn window(
                             ui.end_row();
                         });
                     });
-                    let after = format!("{:?}", (&pa.after_stop, &pa.folder, pa.save_format, &pa.title_pattern, pa.previous_description, &pa.description));
+                    let after = format!("{:?}", (&pa.after_stop, &pa.folder, pa.save_format, &pa.title_pattern, pa.previous_description, &pa.description, &pa.file_pattern, pa.overwrite));
                     if before != after {
                         s.programs.insert(key, pa);
                         changed = true;
                     }
                 }
+                ui.add_space(10.0);
+                ui.heading("Logboek");
+                let entries: Vec<&LogEntry> = log.iter().rev().filter(|l| l.profile == "Automatisch").take(60).collect();
+                if entries.is_empty() {
+                    ui.label(RichText::new("Nog niets gebeurd.").color(DIM));
+                }
+                egui::ScrollArea::vertical().id_salt("autolog").max_height(180.0).show(ui, |ui| {
+                    for l in entries {
+                        let col = match l.level {
+                            Level::Ok => GREEN,
+                            Level::Warn => AMBER,
+                            Level::Error => RED,
+                            Level::Info => egui::Color32::from_rgb(0xd0, 0xd4, 0xdb),
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(RichText::new(&l.time).monospace().size(11.5).color(DIM));
+                            ui.label(RichText::new(&l.text).color(col));
+                        });
+                    }
+                });
                 ui.add_space(10.0);
                 ui.separator();
                 ui.label(RichText::new("Testen vanuit PowerShell op deze pc:").color(DIM));

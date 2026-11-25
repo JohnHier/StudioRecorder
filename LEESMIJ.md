@@ -1,4 +1,4 @@
-# StudioRecorder 0.9.0
+# StudioRecorder 0.9.1
 
 Eenvoudige opname-app voor de radiostudio: opnemen met live waveform en VU-meter, daarna begin en eind trimmen, foutjes eruit knippen, exporteren naar FLAC, WAV of MP3 en aanleveren bij AudioShare.
 
@@ -146,8 +146,11 @@ en een optionele sleutel. Met een sleutel moet elk bericht `key=<sleutel>` bevat
 3. het **vaste programma**.
 Vindt hij niets, dan neemt hij niet op (`ERR UNKNOWN_PROGRAM`).
 
-**Na STOP, per programma**: *Alleen opslaan*, *Alleen uploaden* of *Opslaan + uploaden*.
+**Na STOP, per programma**: *Alleen opslaan* (standaard), *Alleen uploaden* of *Opslaan + uploaden*.
 - Opslaan: in de gekozen map (standaard `<opnamemap>\Automatisch\<programma>`), als FLAC, WAV of MP3 320k.
+  **Bestandsnaam** (vanaf 0.9.1): leeg = de titel, of een vaste naam zoals `testprogramma` (ook met `{datum}` enz.).
+  Met **Bestaand bestand overschrijven** is het steeds hetzelfde bestand: eerst volledig naar een tijdelijk bestand, dan in één keer omgewisseld.
+  Is het oude bestand in gebruik (bijv. door de playout), dan blijft het staan en krijgt de nieuwe opname (2) erachter, met een melding in het logboek.
 - Uploaden: als MP3 320k via de uploadwachtrij, met de koppeling van de studio. In AudioShare staat *bediend door: Automatisch*.
   Kan alleen als de pc als studio is gekoppeld en het een AudioShare-programma van de studio is.
 - Uitzenddatum = de dag van de opname. Titel volgens een patroon (standaard `{programma} — {datum}`, ook `{tijd}` en `{week}`).
@@ -155,7 +158,7 @@ Vindt hij niets, dan neemt hij niet op (`ERR UNKNOWN_PROGRAM`).
 - Staat er al een aflevering op die datum, dan wacht de upload op een bevestiging in het tabblad Uploads (er wordt niets automatisch vervangen).
 - Het originele 24-bit WAV-bestand blijft altijd in de opnamemap staan.
 
-Alles komt in het logboek (tabblad **Uploads**) onder *Automatisch*, ook genegeerde berichten van niet-toegestane afzenders.
+Alles komt in het **logboek onderaan het venster Automatische opname** (vanaf 0.9.1, ook zonder AudioShare-koppeling), ook genegeerde berichten van niet-toegestane afzenders.
 De automatische modus werkt ook als het venster geminimaliseerd is. Een automatische opname kun je met de rode knop stoppen; hij wordt dan verwerkt zoals bij STOP.
 
 Testen vanuit PowerShell op dezelfde pc:

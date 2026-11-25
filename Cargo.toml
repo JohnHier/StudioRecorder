@@ -1,6 +1,6 @@
 [package]
 name = "studiorecorder"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 default-run = "studiorecorder"
 rust-version = "1.91"
@@ -48,3 +48,10 @@ eframe = { version = "0.33", default-features = false, features = ["glow", "defa
 # Optimise dependencies in debug builds too (Argon2, FLAC and MP3 are slow otherwise).
 [profile.dev.package."*"]
 opt-level = 2
+
+# Snelle testbuild: `cargo build --profile snel` (iets grotere/tragere exe, veel sneller gebouwd).
+[profile.snel]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

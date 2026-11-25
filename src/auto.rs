@@ -85,17 +85,24 @@ pub struct ProgAuto {
     /// Omschrijving van de vorige aflevering (AudioShare) gebruiken; anders `description`.
     pub previous_description: bool,
     pub description: String,
+    /// Bestandsnaam bij opslaan (leeg = de titel). Zelfde variabelen als de titel.
+    pub file_pattern: String,
+    /// Een bestaand bestand met dezelfde naam vervangen (anders " (2)" erachter).
+    pub overwrite: bool,
 }
 
 impl Default for ProgAuto {
     fn default() -> Self {
         ProgAuto {
-            after_stop: AfterStop::Both,
+            // Veilig standaard: uploaden kies je bewust (en kan alleen met een studiokoppeling).
+            after_stop: AfterStop::Save,
             folder: String::new(),
             save_format: ExportFormat::Flac,
             title_pattern: "{programma} — {datum}".into(),
             previous_description: true,
             description: String::new(),
+            file_pattern: String::new(),
+            overwrite: false,
         }
     }
 }
@@ -633,23 +640,50 @@ fn process(c: &Ctx, r: &Running, queue: &Queue) -> (String, bool) {
     };
 
     let mut done = Vec::new();
-    let mut failed = false;
+    let mut errors: Vec<String> = Vec::new();
     let auto_dir = PathBuf::from(&c.record_folder).join("Automatisch").join(safe_file_part(&r.program_name));
 
     if pa.after_stop.saves() {
         let dir = if pa.folder.trim().is_empty() { auto_dir.clone() } else { PathBuf::from(pa.folder.trim()) };
+        let fname = match safe_file_part(&title_from(&pa.file_pattern, &r.program_name, r.started)) {
+            n if pa.file_pattern.trim().is_empty() || n.is_empty() => name.clone(),
+            n => n,
+        };
+        let ext = pa.save_format.ext();
         let res = std::fs::create_dir_all(&dir).map_err(|e| format!("map {}: {e}", dir.display())).and_then(|_| {
-            let dst = unique(&dir, &name, pa.save_format.ext());
-            export_to(&dst, pa.save_format).map(|_| dst)
+            if pa.overwrite {
+                // Eerst volledig naar een tijdelijk bestand, dan in één keer omwisselen:
+                // wie het bestand leest (playout) ziet nooit een half bestand.
+                let dst = dir.join(format!("{fname}.{ext}"));
+                let tmp = dir.join(format!("~{fname}.tmp.{ext}"));
+                export_to(&tmp, pa.save_format)?;
+                match std::fs::rename(&tmp, &dst) {
+                    Ok(()) => Ok((dst, true)),
+                    Err(e) => {
+                        // Oud bestand is in gebruik: nieuwe versie toch bewaren, met een andere naam.
+                        let alt = unique(&dir, &fname, ext);
+                        let _ = std::fs::rename(&tmp, &alt);
+                        Err(format!("{} kon niet worden overschreven ({e}); nieuwe opname staat in {}", dst.display(), alt.display()))
+                    }
+                }
+            } else {
+                let dst = unique(&dir, &fname, ext);
+                export_to(&dst, pa.save_format).map(|_| (dst, false))
+            }
         });
+        let fmt = match pa.save_format {
+            ExportFormat::Flac => "FLAC",
+            ExportFormat::Wav => "WAV",
+            ExportFormat::Mp3 => "MP3",
+        };
         match res {
-            Ok(dst) => {
-                log(queue, Level::Ok, format!("Opgeslagen: {}", dst.display()));
-                done.push("opgeslagen".to_string());
+            Ok((dst, replaced)) => {
+                log(queue, Level::Ok, format!("Opgeslagen als {fmt}{}: {}", if replaced { " (overschreven)" } else { "" }, dst.display()));
+                done.push(format!("opgeslagen als {fmt}: {}", dst.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
             }
             Err(e) => {
                 log(queue, Level::Error, format!("Opslaan {} mislukt: {e}", r.program_name));
-                failed = true;
+                errors.push(format!("opslaan mislukt: {e}"));
             }
         }
     }
@@ -658,11 +692,11 @@ fn process(c: &Ctx, r: &Running, queue: &Queue) -> (String, bool) {
         match (studio, as_prog) {
             (None, _) => {
                 log(queue, Level::Error, format!("{}: niet geüpload — deze pc is niet als studio gekoppeld met AudioShare", r.program_name));
-                failed = true;
+                errors.push("niet geüpload: deze pc is niet gekoppeld met AudioShare".into());
             }
             (Some(_), None) => {
                 log(queue, Level::Error, format!("{}: niet geüpload — dit is geen AudioShare-programma van deze studio", r.program_name));
-                failed = true;
+                errors.push("niet geüpload: geen AudioShare-programma van deze studio".into());
             }
             (Some(st), Some(p)) => {
                 let dir = auto_dir.join("upload");
@@ -691,19 +725,17 @@ fn process(c: &Ctx, r: &Running, queue: &Queue) -> (String, bool) {
                     }
                     Err(e) => {
                         log(queue, Level::Error, format!("Export voor upload {} mislukt: {e}", r.program_name));
-                        failed = true;
+                        errors.push(format!("upload-export mislukt: {e}"));
                     }
                 }
             }
         }
     }
 
-    let msg = if done.is_empty() {
-        format!("{} — mislukt, zie logboek (origineel: {})", r.program_name, r.path.display())
-    } else {
-        format!("{} — {}{}", meta.title, done.join(" en "), if failed { " (deels mislukt, zie logboek)" } else { "" })
-    };
-    (msg, failed)
+    let mut parts = done;
+    parts.extend(errors.iter().cloned());
+    let msg = if parts.is_empty() { format!("{} — niets te doen", r.program_name) } else { format!("{} — {}", r.program_name, parts.join(" · ")) };
+    (msg, !errors.is_empty())
 }
 
 #[cfg(test)]
@@ -864,6 +896,46 @@ mod udp_tests {
         // afzender niet toegestaan → geen antwoord
         auto.ctx.lock().unwrap().auto.allowed = vec!["10.9.9.9".into()];
         std::thread::sleep(Duration::from_millis(600));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Vaste bestandsnaam + overschrijven: steeds hetzelfde bestand, zonder (2).
+#[cfg(test)]
+mod overwrite_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_name_overwrites() {
+        let dir = std::env::temp_dir().join(format!("autoow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.join("cfg")) };
+        unsafe { std::env::set_var("APPDATA", dir.join("cfg")) };
+        let queue = Queue::start();
+        // een korte opname maken
+        let wav = dir.join("bron.wav");
+        let mut w = crate::wav::WavWriter::create(&wav, 48000, 2, 24).unwrap();
+        w.write_f32(&vec![0.1f32; 48000 * 2]).unwrap();
+        w.finalize().unwrap();
+        let mut c = Ctx { record_folder: dir.to_string_lossy().into_owned(), fade_ms: 10, ..Default::default() };
+        let prog = ProgRef { id: None, name: "Testprogramma".into() };
+        c.auto.programs.insert(
+            prog.key(),
+            ProgAuto { save_format: ExportFormat::Wav, file_pattern: "testprogramma".into(), overwrite: true, ..Default::default() },
+        );
+        let r = Running { program: prog, program_name: "Testprogramma".into(), path: wav, started: Local::now(), since: Instant::now() };
+        for _ in 0..2 {
+            let (msg, err) = process(&c, &r, &queue);
+            assert!(!err, "{msg}");
+        }
+        let out = dir.join("Automatisch").join("Testprogramma");
+        let names: Vec<String> = std::fs::read_dir(&out).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["testprogramma.wav".to_string()], "precies één bestand, overschreven");
+        // zonder overschrijven: (2)
+        c.auto.programs.get_mut("Testprogramma").unwrap().overwrite = false;
+        process(&c, &r, &queue);
+        assert!(out.join("testprogramma (2).wav").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
