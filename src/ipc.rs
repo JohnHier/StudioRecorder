@@ -7,11 +7,14 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const PORT: u16 = 47_811;
+/// One port per program, so a file goes to the right one.
+fn port() -> u16 {
+    if crate::edition::archive() { 47_812 } else { 47_811 }
+}
 
 /// Hand a file to a running instance. True when it took it over.
 pub fn handoff(path: &str) -> bool {
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], PORT));
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port()));
     match TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
         Ok(mut s) => {
             let _ = s.write_all(format!("STUDIOREC {path}\n").as_bytes());
@@ -23,7 +26,7 @@ pub fn handoff(path: &str) -> bool {
 
 /// Listen for files handed over by later instances.
 pub fn listen() -> Option<Receiver<PathBuf>> {
-    let l = TcpListener::bind(("127.0.0.1", PORT)).ok()?;
+    let l = TcpListener::bind(("127.0.0.1", port())).ok()?;
     let (tx, rx) = unbounded();
     std::thread::spawn(move || {
         for s in l.incoming().flatten() {

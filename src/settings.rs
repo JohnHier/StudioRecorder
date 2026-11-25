@@ -25,6 +25,16 @@ pub struct Settings {
     pub auto_upload: bool,
     /// Per AudioShare profile: the programme chosen last (makers with several programmes).
     pub last_program: HashMap<String, i64>,
+    /// MP3 bitrate (StudioRecorder: always 320).
+    pub mp3_kbps: u32,
+    /// ArchiefRecorder: export in mono.
+    pub mono: bool,
+    /// ArchiefRecorder: volume leveler.
+    pub level_on: bool,
+    pub level: crate::level::LevelParams,
+    /// ArchiefRecorder: peak limiter.
+    pub limiter_on: bool,
+    pub limiter: crate::level::LimiterParams,
 }
 
 impl Default for Settings {
@@ -34,12 +44,18 @@ impl Default for Settings {
             output_id: String::new(),
             record_folder: default_folder().to_string_lossy().into_owned(),
             studio_name: String::new(),
-            export_format: ExportFormat::Flac,
+            export_format: if crate::edition::archive() { ExportFormat::Mp3 } else { ExportFormat::Flac },
             fade_ms: 10,
             programs: Vec::new(),
             last_episode: HashMap::new(),
             auto_upload: true,
             last_program: HashMap::new(),
+            mp3_kbps: if crate::edition::archive() { 192 } else { 320 },
+            mono: false,
+            level_on: crate::edition::archive(),
+            level: Default::default(),
+            limiter_on: crate::edition::archive(),
+            limiter: Default::default(),
         }
     }
 }
@@ -51,17 +67,17 @@ fn default_folder() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."));
     let music = home.join("Music");
     let base = if music.is_dir() { music } else { home };
-    base.join("StudioRecorder")
+    base.join(crate::edition::app_name())
 }
 
-/// %APPDATA%\StudioRecorder (or the XDG config folder elsewhere).
+/// %APPDATA%\StudioRecorder or %APPDATA%\ArchiefRecorder (or the XDG config folder elsewhere).
 pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA")
         .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("StudioRecorder")
+    base.join(crate::edition::app_name())
 }
 
 fn settings_path() -> PathBuf {

@@ -59,6 +59,7 @@ fn make_mp3(name: &str, secs: u32) -> PathBuf {
         fade_ms: 0,
         crossfade_ms: 10,
         tags: vec![],
+        opts: Default::default(),
     };
     export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
     mp3

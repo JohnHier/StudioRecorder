@@ -23,7 +23,7 @@ pub fn needs_decoding(p: &Path) -> bool {
 }
 
 fn cache_dir() -> PathBuf {
-    std::env::temp_dir().join("StudioRecorder")
+    std::env::temp_dir().join(crate::edition::app_name())
 }
 
 /// Remove working copies older than a week.
@@ -168,7 +168,7 @@ mod tests {
     fn exported(src: &Path, fmt: ExportFormat) -> PathBuf {
         let dst = src.with_extension(fmt.ext());
         let mut r = WavReader::open(src).unwrap();
-        let job = ExportJob { src, dst: &dst, format: fmt, segments: vec![(0, r.frames)], fade_ms: 0, crossfade_ms: 10, tags: vec![] };
+        let job = ExportJob { src, dst: &dst, format: fmt, segments: vec![(0, r.frames)], fade_ms: 0, crossfade_ms: 10, tags: vec![], opts: Default::default() };
         export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
         let _ = r.read_f32(0, 1, &mut Vec::new());
         dst

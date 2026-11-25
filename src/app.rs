@@ -2,6 +2,7 @@
 
 use crate::engine::{self, Engine, InputChoice};
 use crate::export::{self, ExportFormat, ExportJob};
+use crate::level::{Analysis, GainCurve, LevelParams, LevelPlan};
 use crate::meta::{Meta, safe_file_part};
 
 #[path = "as_ui.rs"]
@@ -819,6 +820,26 @@ impl Meter {
 // ---------------------------------------------------------------------------
 
 /// Crossfade at every cut in the exported file.
+/// Export format buttons. ArchiefRecorder also offers MP3 192k.
+fn format_choice(ui: &mut egui::Ui, settings: &mut Settings) -> bool {
+    let mut changed = false;
+    changed |= ui.selectable_value(&mut settings.export_format, ExportFormat::Flac, "FLAC").changed();
+    changed |= ui.selectable_value(&mut settings.export_format, ExportFormat::Wav, "WAV").changed();
+    if crate::edition::archive() {
+        for kbps in [320u32, 192] {
+            let sel = settings.export_format == ExportFormat::Mp3 && settings.mp3_kbps == kbps;
+            if ui.selectable_label(sel, format!("MP3 {kbps}k")).clicked() {
+                settings.export_format = ExportFormat::Mp3;
+                settings.mp3_kbps = kbps;
+                changed = true;
+            }
+        }
+    } else {
+        changed |= ui.selectable_value(&mut settings.export_format, ExportFormat::Mp3, "MP3 320k").changed();
+    }
+    changed
+}
+
 const CROSSFADE_MS: u32 = 10;
 
 /// The last `n` frames of a list of ranges.
@@ -937,6 +958,16 @@ struct Editor {
     /// Index of a clicked cut (to listen to or restore).
     sel_cut: Option<usize>,
     undo: Vec<Vec<(u64, u64)>>,
+    /// ArchiefRecorder: loudness measurement of the whole file (background).
+    analysis: Option<Arc<Analysis>>,
+    analyzing: Option<(Arc<AtomicU32>, Receiver<Result<Analysis, String>>)>,
+    /// Integrated loudness of the file (LUFS).
+    loudness: Option<f32>,
+    /// Gain curve for the current leveler settings.
+    curve: Option<Arc<GainCurve>>,
+    curve_params: Option<LevelParams>,
+    /// Listen to the original instead of the leveled sound (A/B).
+    listen_original: bool,
 }
 
 impl Editor {
@@ -964,7 +995,51 @@ impl Editor {
             sel: None,
             sel_cut: None,
             undo: Vec::new(),
+            analysis: None,
+            analyzing: None,
+            loudness: None,
+            curve: None,
+            curve_params: None,
+            listen_original: false,
         }
+    }
+
+    /// Measure the loudness of the whole file in the background (ArchiefRecorder).
+    fn start_analysis(&mut self) {
+        let progress = Arc::new(AtomicU32::new(0));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (p, pr) = (self.path.clone(), progress.clone());
+        std::thread::spawn(move || {
+            let res = WavReader::open(&p)
+                .map_err(|e| format!("Analyse: kan bestand niet openen: {e}"))
+                .and_then(|mut r| crate::level::analyze(&mut r, &pr, &AtomicBool::new(false)));
+            let _ = tx.send(res);
+        });
+        self.analyzing = Some((progress, rx));
+    }
+
+    /// Pick up a finished analysis and keep the gain curve in step with the settings.
+    fn update_leveler(&mut self, params: &LevelParams) -> Option<String> {
+        let mut err = None;
+        if let Some((_, rx)) = &self.analyzing {
+            if let Ok(res) = rx.try_recv() {
+                self.analyzing = None;
+                match res {
+                    Ok(a) => {
+                        self.loudness = Some(a.integrated());
+                        self.analysis = Some(Arc::new(a));
+                    }
+                    Err(e) => err = Some(e),
+                }
+            }
+        }
+        if let Some(a) = &self.analysis {
+            if self.curve_params.as_ref() != Some(params) {
+                self.curve = Some(Arc::new(GainCurve::compute(a, params)));
+                self.curve_params = Some(*params);
+            }
+        }
+        err
     }
 
     /// The parts of [a, b) that are not cut out.
@@ -1180,7 +1255,7 @@ impl App {
             export_result: None,
             player: Player::default(),
             show_settings: false,
-            meta: Meta { date: Meta::today(), ..Default::default() },
+            meta: Meta::fresh(),
             form: FormState::default(),
             new_program: String::new(),
             toast: None,
@@ -1204,7 +1279,9 @@ impl App {
         if let Some(p) = std::env::args().nth(1) {
             app.open_path(PathBuf::from(p));
         } else {
-            app.aus.auto_link();
+            if !crate::edition::archive() {
+                app.aus.auto_link();
+            }
         }
         app
     }
@@ -1257,7 +1334,7 @@ impl App {
         }
         let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         match ext.as_str() {
-            "audioshare" => self.aus.open_link(Some(&p)),
+            "audioshare" if !crate::edition::archive() => self.aus.open_link(Some(&p)),
             "wav" | "mp3" | "flac" if self.loading.is_none() && self.exporting.is_none() => self.load_file(p),
             _ => {}
         }
@@ -1340,7 +1417,7 @@ impl App {
         let active = self.aus.session_key();
         if active != self.meta_profile {
             self.meta_profile = active.clone();
-            self.meta = Meta { date: Meta::today(), ..Default::default() };
+            self.meta = Meta::fresh();
             self.form = FormState::default();
         }
         let Some(prof) = self.aus.active_profile() else { return };
@@ -1375,6 +1452,12 @@ impl App {
                 ui.vertical(|ui| {
                     ui.set_width(w);
                     ui.set_min_height(96.0);
+                    if crate::edition::archive() {
+                        ui.label(egui::RichText::new("Opnemen voor het archief").size(14.0).strong());
+                        ui.add_space(4.0);
+                        hint_line(ui, "Neem een hele kant van de cassette of band in één keer op. Daarna knip je bij Bewerken de stukken eruit, stel je het volume in en exporteer je.");
+                        return;
+                    }
                     if !self.aus.configured() {
                         ui.label(egui::RichText::new("Programmagegevens").size(14.0).strong());
                         ui.add_space(4.0);
@@ -1550,7 +1633,11 @@ impl App {
                 self.meta.save(&path);
                 self.settings.remember(&self.meta);
                 self.settings.save();
-                self.editor = Some(Editor::new(path.clone(), path.clone(), fmt, res.frames, peaks, self.meta.clone()));
+                let mut ed = Editor::new(path.clone(), path.clone(), fmt, res.frames, peaks, self.meta.clone());
+                if crate::edition::archive() {
+                    ed.start_analysis();
+                }
+                self.editor = Some(ed);
                 self.export_result = None;
                 self.mode = Mode::Edit;
                 self.toast(format!("Opname opgeslagen: {}", path.display()), false);
@@ -1595,6 +1682,10 @@ impl App {
             self.export_result = Some(Err(format!("Vul voor het uploaden eerst in: {} (of zet uploaden uit)", missing.join(", "))));
             return;
         }
+        if crate::edition::archive() && self.settings.level_on && ed.curve.is_none() {
+            self.export_result = Some(Err("De volumemeting loopt nog — even wachten, of zet de leveler uit".into()));
+            return;
+        }
         let fmt = self.settings.export_format;
         let name = ed.export_name.trim();
         let name = if name.is_empty() { "export" } else { name };
@@ -1620,14 +1711,29 @@ impl App {
         self.settings.remember(&ed.meta);
         self.settings.save();
         let upload = self.upload_plan();
+        let opts = self.export_options();
         let (pr, ca, d2) = (progress.clone(), cancel.clone(), dst.clone());
         std::thread::spawn(move || {
-            let job = ExportJob { src: &src, dst: &d2, format: fmt, segments, fade_ms: fade, crossfade_ms: CROSSFADE_MS, tags };
+            let job = ExportJob { src: &src, dst: &d2, format: fmt, segments, fade_ms: fade, crossfade_ms: CROSSFADE_MS, tags, opts };
             let _ = tx.send(export::export(&job, &pr, &ca));
         });
         self.export_result = None;
         self.last_job = None;
         self.exporting = Some(Exporting { upload, dst, progress, cancel, rx, started: Instant::now() });
+    }
+
+    /// MP3 bitrate, mono and leveler for this export (StudioRecorder: the defaults).
+    fn export_options(&self) -> export::ExportOptions {
+        if !crate::edition::archive() {
+            return export::ExportOptions::default();
+        }
+        export::ExportOptions {
+            mp3_kbps: self.settings.mp3_kbps,
+            // "NearBest": LAME's recommended high quality, ~2.7x faster than "Best"
+            mp3_quality: Some(2),
+            mono: self.settings.mono,
+            level: self.level_plan(false),
+        }
     }
 
     /// Upload after export? Only with a signed-in maker and an AudioShare programme.
@@ -1664,8 +1770,15 @@ impl App {
                         if frames == 0 {
                             self.toast("Dit bestand bevat geen audio", true);
                         } else {
-                            let meta = Meta::load(&path).unwrap_or_else(|| Meta { date: Meta::today(), ..Default::default() });
-                            self.editor = Some(Editor::new(work, path, fmt, frames, peaks, meta));
+                            let meta = Meta::load(&path).unwrap_or_else(|| Meta::fresh());
+                            let mut ed = Editor::new(work, path, fmt, frames, peaks, meta);
+                            if crate::edition::archive() {
+                                ed.start_analysis();
+                                if let Some(n) = ed.meta.archive_name() {
+                                    ed.export_name = n;
+                                }
+                            }
+                            self.editor = Some(ed);
                             self.export_result = None;
                         }
                     }
@@ -1700,7 +1813,30 @@ impl App {
                 self.export_result = Some(res.map(|_| dst));
             }
         }
+        if crate::edition::archive() {
+            let params = self.settings.level;
+            if let Some(err) = self.editor.as_mut().and_then(|e| e.update_leveler(&params)) {
+                self.toast(err, true);
+            }
+        }
         self.player.tick();
+    }
+
+    /// Leveler and limiter as they are set now (ArchiefRecorder; None = plain).
+    fn level_plan(&self, for_listening: bool) -> Option<Arc<LevelPlan>> {
+        if !crate::edition::archive() {
+            return None;
+        }
+        let ed = self.editor.as_ref()?;
+        if for_listening && ed.listen_original {
+            return None;
+        }
+        let curve = if self.settings.level_on { ed.curve.clone() } else { None };
+        let limiter = self.settings.limiter_on.then_some(self.settings.limiter);
+        if curve.is_none() && limiter.is_none() {
+            return None;
+        }
+        Some(Arc::new(LevelPlan { curve, limiter }))
     }
 
     // -----------------------------------------------------------------------
@@ -1711,15 +1847,20 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_space(4.0);
             let (r, _) = ui.allocate_exact_size(vec2(22.0, 32.0), Sense::hover());
-            ui.painter().circle_filled(r.center(), 9.0, RED);
+            ui.painter().circle_filled(r.center(), 9.0, if crate::edition::archive() { AMBER } else { RED });
             ui.painter().circle_stroke(r.center(), 9.0, Stroke::new(2.0, TEXT.gamma_multiply(0.9)));
-            ui.label(egui::RichText::new("StudioRecorder").size(18.0).strong().color(TEXT));
-            ui.label(egui::RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).size(12.0).color(DIM));
+            ui.label(egui::RichText::new(crate::edition::app_name()).size(18.0).strong().color(TEXT));
+            ui.label(egui::RichText::new(format!("v{}", crate::edition::version())).size(12.0).color(DIM));
             ui.add_space(24.0);
             let rec = self.is_recording();
             let open_jobs = self.aus.open_count();
             let uploads_label = if open_jobs > 0 { format!("Uploads ({open_jobs})") } else { "Uploads".to_string() };
-            for (m, label) in [(Mode::Record, "Opnemen"), (Mode::Edit, "Bewerken"), (Mode::Uploads, uploads_label.as_str())] {
+            let tabs: &[(Mode, &str)] = if crate::edition::archive() {
+                &[(Mode::Record, "Opnemen"), (Mode::Edit, "Bewerken")]
+            } else {
+                &[(Mode::Record, "Opnemen"), (Mode::Edit, "Bewerken"), (Mode::Uploads, uploads_label.as_str())]
+            };
+            for &(m, label) in tabs {
                 let selected = self.mode == m;
                 let text = if m == Mode::Record && rec && !selected { "Opnemen  ● REC" } else { label };
                 let font = FontId::proportional(15.0);
@@ -1758,7 +1899,9 @@ impl App {
                     }
                 }
                 ui.add_space(10.0);
-                self.aus.top_chip(ui);
+                if !crate::edition::archive() {
+                    self.aus.top_chip(ui);
+                }
             });
         });
     }
@@ -2006,7 +2149,7 @@ impl App {
                 ui.label(egui::RichText::new(format!("Vrije schijfruimte: {} (≈ {:.0} uur opnametijd)", gb(free), hours)).color(DIM).size(12.0));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                logo(ui, &self.logo, 15.0).on_hover_text(concat!("StudioRecorder v", env!("CARGO_PKG_VERSION"), " — JohnWorks"));
+                logo(ui, &self.logo, 15.0).on_hover_text(format!("{} v{} — JohnWorks", crate::edition::app_name(), crate::edition::version()));
             });
         });
     }
@@ -2163,7 +2306,9 @@ impl App {
 
         // Main waveform
         let avail = ui.available_size();
-        let wave_h = (avail.y - 500.0).clamp(100.0, 520.0);
+        // room below the waveform for the controls (ArchiefRecorder: also the volume panel)
+        let reserve = if crate::edition::archive() { if self.settings.level_on || self.settings.limiter_on { 545.0 } else { 505.0 } } else { 500.0 };
+        let wave_h = (avail.y - reserve).clamp(100.0, 520.0);
         let (outer, resp) = ui.allocate_exact_size(vec2(avail.x, wave_h), Sense::click_and_drag());
         let p = ui.painter_at(outer);
         p.rect_filled(outer, 8.0, PANEL);
@@ -2380,6 +2525,34 @@ impl App {
             }
         } else {
             draw_wave(&p, wave_rect, &WaveSource::Peaks(&ed.peaks), ch, ed.view_start, ed.view_len, &color_for);
+        }
+
+        // ArchiefRecorder: the leveler's gain curve over the waveform
+        if crate::edition::archive() && self.settings.level_on {
+            if let Some(curve) = ed.curve.clone() {
+                let mid = wave_rect.center().y;
+                let span = wave_rect.height() * 0.45 / 18.0; // ±18 dB fills the lane
+                let y_of = |d: f32| mid - d.clamp(-18.0, 18.0) * span;
+                p.line_segment([pos2(wave_rect.left(), mid), pos2(wave_rect.right(), mid)], Stroke::new(1.0, AMBER.gamma_multiply(0.25)));
+                let mut pts = Vec::new();
+                let mut x = wave_rect.left();
+                while x <= wave_rect.right() {
+                    let f = f_of(ed, x).clamp(0.0, ed.frames as f64) as u64;
+                    pts.push(pos2(x, y_of(curve.db_at(f))));
+                    x += 2.0;
+                }
+                p.add(egui::Shape::line(pts, Stroke::new(2.0, AMBER)));
+                let marks: &[f32] = if wave_rect.height() > 220.0 { &[12.0, 6.0, 0.0, -6.0, -12.0] } else { &[12.0, 0.0, -12.0] };
+                for &d in marks {
+                    p.text(pos2(wave_rect.left() + 4.0, y_of(d)), Align2::LEFT_CENTER, format!("{d:+.0} dB"), FontId::proportional(10.5), AMBER.gamma_multiply(0.55));
+                }
+                if let Some(h) = hover {
+                    if wave_rect.contains(h) {
+                        let f = frame_at(ed, h.x);
+                        p.text(pos2(h.x + 6.0, wave_rect.top() + 4.0), Align2::LEFT_TOP, format!("leveler {:+.1} dB", curve.db_at(f)), FontId::monospace(11.0), AMBER);
+                    }
+                }
+            }
         }
 
         // Cut-out parts
@@ -2661,6 +2834,108 @@ impl App {
             });
         });
 
+        // Volume (ArchiefRecorder): leveler and peak limiter
+        if crate::edition::archive() {
+            ui.add_space(10.0);
+            let mut changed = false;
+            let mut restart = false;
+            egui::Frame::NONE.fill(PANEL).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Volume").strong().color(TEXT));
+                    ui.add_space(10.0);
+                    changed |= ui
+                        .checkbox(&mut self.settings.level_on, "Volume gelijktrekken (leveler)")
+                        .on_hover_text("Stelt het volume steeds bij naar het doelniveau. Kijkt vooruit en achteruit, dus de regeling begint al vóór een hard of zacht stuk. Stiltes en bandruis worden niet versterkt.")
+                        .changed();
+                    ui.add_space(10.0);
+                    changed |= ui
+                        .checkbox(&mut self.settings.limiter_on, "Piekbegrenzer")
+                        .on_hover_text("Ziet pieken aankomen (look-ahead) en zet het volume er net vóór zacht terug, zodat niets boven het plafond komt en niets vervormt.")
+                        .changed();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some((pr, _)) = &ed.analyzing {
+                            let v = pr.load(Ordering::Relaxed) as f32 / 1000.0;
+                            ui.add(egui::ProgressBar::new(v).desired_width(140.0).show_percentage());
+                            ui.label(egui::RichText::new("Volume meten").color(DIM));
+                        } else if let Some(l) = ed.loudness {
+                            let range = ed.curve.as_ref().filter(|_| self.settings.level_on).map(|c| {
+                                let lo = c.db.iter().copied().fold(f32::MAX, f32::min);
+                                let hi = c.db.iter().copied().fold(f32::MIN, f32::max);
+                                format!(" · leveler {lo:+.1} tot {hi:+.1} dB")
+                            });
+                            ui.label(egui::RichText::new(format!("Gemeten: {l:.1} LUFS{}", range.unwrap_or_default())).color(DIM))
+                                .on_hover_text("LUFS = gemeten luidheid (EBU R128). Radio en streaming zitten meestal rond −16 tot −23 LUFS.");
+                        }
+                    });
+                });
+                if self.settings.level_on || self.settings.limiter_on {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().slider_width = 70.0;
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let lp = &mut self.settings.level;
+                        ui.add_enabled_ui(self.settings.level_on, |ui| {
+                            ui.label(egui::RichText::new("Doel").color(DIM));
+                            changed |= ui.add(egui::Slider::new(&mut lp.target_lufs, -24.0..=-10.0).step_by(0.5).suffix(" LUFS")).on_hover_text("Hoe luid het resultaat wordt. −16 LUFS is een gangbare waarde om naar te luisteren.").changed();
+                            ui.add_space(8.0);
+                            for sp in [crate::level::Speed::Calm, crate::level::Speed::Normal, crate::level::Speed::Fast] {
+                                changed |= ui
+                                    .selectable_value(&mut lp.speed, sp, sp.label())
+                                    .on_hover_text(format!("Kijkt {:.0} seconden vooruit en achteruit. Zachte stukken en fades korter dan dat blijven zoals ze zijn.", sp.window()))
+                                    .changed();
+                            }
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Max. versterking").color(DIM));
+                            changed |= ui.add(egui::Slider::new(&mut lp.max_boost_db, 0.0..=20.0).step_by(1.0).suffix(" dB")).on_hover_text("Nooit méér versterken dan dit, zodat heel zachte opnames niet met ruis en al worden opgeblazen.").changed();
+                            ui.add_space(8.0);
+                            ui.label(egui::RichText::new("Stiltedrempel").color(DIM));
+                            changed |= ui.add(egui::Slider::new(&mut lp.gate_lufs, -60.0..=-30.0).step_by(1.0).suffix(" LUFS")).on_hover_text("Alles zachter dan dit telt als stilte of bandruis en wordt niet versterkt. Hoor je de ruis tussen nummers opkomen? Zet de drempel hoger (bijv. −40).").changed();
+                        });
+                        ui.add_space(8.0);
+                        ui.add_enabled_ui(self.settings.limiter_on, |ui| {
+                            ui.label(egui::RichText::new("Plafond").color(DIM));
+                            changed |= ui.add(egui::Slider::new(&mut self.settings.limiter.ceiling_db, -3.0..=-0.1).step_by(0.1).suffix(" dB")).on_hover_text("Hoogste piek in het bestand (piekbegrenzer). −1 dB laat wat ruimte voor het omzetten naar MP3.").changed();
+                        });
+                    });
+                }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let active = self.settings.level_on || self.settings.limiter_on;
+                    if active {
+                        if ui
+                            .checkbox(&mut ed.listen_original, "Beluister origineel")
+                            .on_hover_text("Vergelijk: afspelen zonder leveler en piekbegrenzer")
+                            .changed()
+                        {
+                            restart = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(if ed.listen_original {
+                                "Afspelen klinkt nu zonder bewerking."
+                            } else {
+                                "Afspelen klinkt nu zoals de export: met leveler en piekbegrenzer."
+                            })
+                            .color(DIM),
+                        );
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Standaardwaarden").clicked() {
+                            self.settings.level = Default::default();
+                            self.settings.limiter = Default::default();
+                            changed = true;
+                        }
+                    });
+                });
+            });
+            if changed {
+                self.settings.save();
+            }
+            if (changed || restart) && playing {
+                play_req = Some(ed.play_from(ed.playhead));
+            }
+        }
+
         // Export
         ui.add_space(10.0);
         let exporting = self.exporting.is_some();
@@ -2677,10 +2952,14 @@ impl App {
                 ui.add_space(10.0);
                 let mut changed = false;
                 ui.add_enabled_ui(!exporting, |ui| {
-                    changed |= ui.selectable_value(&mut self.settings.export_format, ExportFormat::Flac, "FLAC").changed();
-                    changed |= ui.selectable_value(&mut self.settings.export_format, ExportFormat::Wav, "WAV").changed();
-                    changed |= ui.selectable_value(&mut self.settings.export_format, ExportFormat::Mp3, "MP3 320k").changed();
+                    changed |= format_choice(ui, &mut self.settings);
                     ui.add_space(10.0);
+                    if crate::edition::archive() && ed.fmt.channels == 2 {
+                        changed |= ui
+                            .checkbox(&mut self.settings.mono, "Mono")
+                            .on_hover_text("Beide kanalen samen in één kanaal. Veel cassettes zijn (bijna) mono; het bestand wordt dan half zo groot.")
+                            .changed();
+                    }
                     let mut fade = self.settings.fade_ms > 0;
                     if ui
                         .checkbox(&mut fade, "Korte fade (10 ms)")
@@ -2697,7 +2976,39 @@ impl App {
             });
             // AudioShare: only for a logged-in maker. Programme, date, title and
             // description only matter for the upload, so they're shown only then.
-            if self.aus.active_profile().is_some() {
+            if crate::edition::archive() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+                let mut meta_changed = false;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Titel").color(DIM));
+                    meta_changed |= ui.add(egui::TextEdit::singleline(&mut ed.meta.title).desired_width(200.0).margin(vec2(6.0, 5.0))).changed();
+                    ui.label(egui::RichText::new("Artiest / collectie").color(DIM));
+                    meta_changed |= ui.add(egui::TextEdit::singleline(&mut ed.meta.program).desired_width(170.0).margin(vec2(6.0, 5.0))).changed();
+                    ui.label(egui::RichText::new("Datum").color(DIM));
+                    meta_changed |= ui
+                        .add(egui::TextEdit::singleline(&mut ed.meta.date).hint_text(egui::RichText::new("bijv. 1984").color(HINT)).desired_width(80.0).margin(vec2(6.0, 5.0)))
+                        .changed();
+                    ui.label(egui::RichText::new("Omschrijving").color(DIM));
+                    meta_changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut ed.meta.description)
+                                .hint_text(egui::RichText::new("optioneel, bijv. cassette 12 kant A").color(HINT))
+                                .desired_width(f32::INFINITY)
+                                .margin(vec2(6.0, 5.0)),
+                        )
+                        .changed();
+                });
+                if meta_changed {
+                    ed.meta.save(&ed.origin);
+                    if !ed.name_edited {
+                        if let Some(n) = ed.meta.archive_name() {
+                            ed.export_name = n;
+                        }
+                    }
+                }
+            } else if self.aus.active_profile().is_some() {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(2.0);
@@ -2839,7 +3150,8 @@ impl App {
         }
         if let Some(segs) = play_req {
             let path = self.editor.as_ref().unwrap().path.clone();
-            self.player.play(&path, &segs, output_id.as_deref());
+            let plan = self.level_plan(true);
+            self.player.play_leveled(&path, &segs, output_id.as_deref(), plan);
             if let Some(err) = self.player.error.clone() {
                 self.toast(err, true);
             }
@@ -2897,10 +3209,14 @@ impl App {
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
             .show(ctx, |ui| {
                 egui::Grid::new("settings").num_columns(2).spacing(vec2(14.0, 12.0)).show(ui, |ui| {
-                    ui.label("Naam studio");
+                    ui.label(if crate::edition::archive() { "Naam (archief)" } else { "Naam studio" });
                     changed |= ui
                         .add(egui::TextEdit::singleline(&mut self.settings.studio_name).desired_width(320.0))
-                        .on_hover_text("Komt in de FLAC-gegevens, en in de bestandsnaam als er geen programma is gekozen")
+                        .on_hover_text(if crate::edition::archive() {
+                            "Komt in de gegevens van het bestand (bijv. de naam van je archief), en vooraan in de naam van een opname"
+                        } else {
+                            "Komt in de FLAC-gegevens, en in de bestandsnaam als er geen programma is gekozen"
+                        })
                         .changed();
                     ui.end_row();
 
@@ -2940,7 +3256,7 @@ impl App {
                     });
                     ui.end_row();
 
-                    if !self.aus.configured() {
+                    if !self.aus.configured() && !crate::edition::archive() {
                     ui.label("Programma's");
                     ui.vertical(|ui| {
                         let mut remove: Option<usize> = None;
@@ -2977,27 +3293,31 @@ impl App {
 
                     ui.label("Exportformaat");
                     ui.horizontal(|ui| {
-                        changed |= ui.selectable_value(&mut self.settings.export_format, ExportFormat::Flac, "FLAC").changed();
-                        changed |= ui.selectable_value(&mut self.settings.export_format, ExportFormat::Wav, "WAV").changed();
-                        changed |= ui.selectable_value(&mut self.settings.export_format, ExportFormat::Mp3, "MP3 320k").changed();
+                        changed |= format_choice(ui, &mut self.settings);
                     });
                     ui.end_row();
                 });
                 ui.add_space(8.0);
                 ui.separator();
-                self.aus.settings_section(ui);
+                if !crate::edition::archive() {
+                    self.aus.settings_section(ui);
+                }
                 ui.separator();
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
-                        "Opnames worden als 24-bit WAV opgeslagen (veilig bij een crash). Bij het exporteren\nmaak je er een getrimde FLAC, WAV of MP3 van; het origineel blijft altijd bewaard.",
+                        if crate::edition::archive() {
+                            "Opnames worden als 24-bit WAV opgeslagen (veilig bij een crash). Bij het exporteren\nmaak je er een getrimde, gelijkgetrokken FLAC, WAV of MP3 van; het origineel blijft altijd bewaard."
+                        } else {
+                            "Opnames worden als 24-bit WAV opgeslagen (veilig bij een crash). Bij het exporteren\nmaak je er een getrimde FLAC, WAV of MP3 van; het origineel blijft altijd bewaard."
+                        },
                     )
                     .size(12.0)
                     .color(DIM),
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("StudioRecorder versie {}", env!("CARGO_PKG_VERSION"))).size(11.0).color(DIM));
+                    ui.label(egui::RichText::new(format!("{} versie {}", crate::edition::app_name(), crate::edition::version())).size(11.0).color(DIM));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         logo(ui, &self.logo, 18.0);
                     });
@@ -3096,7 +3416,8 @@ impl eframe::App for App {
         }
 
         // AudioShare: background results, sign-out timer, unlinked recorders.
-        for (pid, for_editor, info) in self.aus.housekeeping(ctx) {
+        let aus_events = if crate::edition::archive() { Vec::new() } else { self.aus.housekeeping(ctx) };
+        for (pid, for_editor, info) in aus_events {
             if for_editor {
                 if let Some(ed) = self.editor.as_mut() {
                     if ed.meta.program_id == Some(pid) && apply_upload_info(&mut ed.meta, &mut ed.form, &info) {
@@ -3133,8 +3454,8 @@ impl eframe::App for App {
             self.toast("Programmalijst wordt opnieuw opgehaald…", false);
         }
         let title = match (true, self.aus.active_name()) {
-            (true, Some(n)) => format!("StudioRecorder v{} — Ingelogd als {n}", env!("CARGO_PKG_VERSION")),
-            _ => format!("StudioRecorder v{}", env!("CARGO_PKG_VERSION")),
+            (true, Some(n)) => format!("{} v{} — Ingelogd als {n}", crate::edition::app_name(), crate::edition::version()),
+            _ => format!("{} v{}", crate::edition::app_name(), crate::edition::version()),
         };
         if title != self.title_shown {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
@@ -3159,7 +3480,9 @@ impl eframe::App for App {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.fill(BG).inner_margin(egui::Margin::symmetric(12, 8)))
                 .show(ctx, |ui| self.mini_screen(ui));
-            self.aus.windows(ctx);
+            if !crate::edition::archive() {
+                self.aus.windows(ctx);
+            }
             self.confirm_dialogs(ctx);
             ctx.request_repaint_after(Duration::from_millis(50));
             return;
@@ -3190,11 +3513,14 @@ impl eframe::App for App {
             });
 
         self.settings_window(ctx);
-        self.aus.windows(ctx);
+        if !crate::edition::archive() {
+            self.aus.windows(ctx);
+        }
         self.confirm_dialogs(ctx);
         self.draw_toast(ctx);
 
-        let busy = self.engine.is_some() || self.player.is_playing() || self.loading.is_some() || self.exporting.is_some();
+        let analysing = self.editor.as_ref().is_some_and(|e| e.analyzing.is_some());
+        let busy = self.engine.is_some() || self.player.is_playing() || self.loading.is_some() || self.exporting.is_some() || analysing;
         if busy {
             ctx.request_repaint_after(Duration::from_millis(30));
         } else {

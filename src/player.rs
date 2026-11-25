@@ -1,5 +1,6 @@
 //! Playback of a list of ranges of a WAV file (skipping cut-out parts).
 
+use crate::level::{LevelPlan, Limiter};
 use crate::wav::WavReader;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -63,15 +64,20 @@ impl Player {
 
     /// Play the given frame ranges of `path` one after another.
     pub fn play(&mut self, path: &Path, segments: &[(u64, u64)], output_id: Option<&str>) {
+        self.play_leveled(path, segments, output_id, None);
+    }
+
+    /// Same, with leveler and/or peak limiter applied (ArchiefRecorder).
+    pub fn play_leveled(&mut self, path: &Path, segments: &[(u64, u64)], output_id: Option<&str>, level: Option<Arc<LevelPlan>>) {
         self.stop();
         self.error = None;
-        if let Err(e) = self.try_play(path, segments, output_id) {
+        if let Err(e) = self.try_play(path, segments, output_id, level) {
             self.error = Some(e);
             self.finished.store(true, Ordering::Relaxed);
         }
     }
 
-    fn try_play(&mut self, path: &Path, segments: &[(u64, u64)], output_id: Option<&str>) -> Result<(), String> {
+    fn try_play(&mut self, path: &Path, segments: &[(u64, u64)], output_id: Option<&str>, level: Option<Arc<LevelPlan>>) -> Result<(), String> {
         let mut reader = WavReader::open(path).map_err(|e| e.to_string())?;
         let file_rate = reader.fmt.sample_rate;
         let file_ch = reader.fmt.channels as usize;
@@ -115,7 +121,8 @@ impl Player {
                     let stop_r = stop.clone();
                     let chunk = (file_rate as usize / 20).max(512);
                     let segs = segs.clone();
-                    std::thread::spawn(move || feed(&mut reader, tx, &segs, chunk, stop_r));
+                    let level = level.clone();
+                    std::thread::spawn(move || feed(&mut reader, tx, &segs, chunk, stop_r, level));
                     stream.play().map_err(|e| e.to_string())?;
                     self.stream = Some(stream);
                     self.stop = stop;
@@ -133,9 +140,12 @@ impl Player {
 /// Short fade at the joins between ranges so jumps over a cut don't click.
 const JOIN_FADE_FRAMES: usize = 240;
 
-fn feed(reader: &mut WavReader, tx: Sender<(u64, Vec<f32>)>, segs: &[(u64, u64)], chunk: usize, stop: Arc<AtomicBool>) {
+fn feed(reader: &mut WavReader, tx: Sender<(u64, Vec<f32>)>, segs: &[(u64, u64)], chunk: usize, stop: Arc<AtomicBool>, level: Option<Arc<LevelPlan>>) {
     let ch = reader.fmt.channels as usize;
     let n_segs = segs.len();
+    let curve = level.as_ref().and_then(|l| l.curve.clone());
+    let mut limiter = level.as_ref().and_then(|l| l.limiter.map(|p| Limiter::new(reader.fmt.sample_rate, ch, &p)));
+    let mut last_pos = segs.first().map(|s| s.0).unwrap_or(0);
     for (k, &(start, end)) in segs.iter().enumerate() {
         let mut pos = start;
         while pos < end && !stop.load(Ordering::Relaxed) {
@@ -144,6 +154,9 @@ fn feed(reader: &mut WavReader, tx: Sender<(u64, Vec<f32>)>, segs: &[(u64, u64)]
             match reader.read_f32(pos, n, &mut v) {
                 Ok(0) | Err(_) => return,
                 Ok(got) => {
+                    if let Some(c) = &curve {
+                        c.apply_f32(pos, &mut v[..got * ch], ch);
+                    }
                     // fade in after a join, fade out before a join
                     for f in 0..got {
                         let from_start = (pos - start) as usize + f;
@@ -161,11 +174,23 @@ fn feed(reader: &mut WavReader, tx: Sender<(u64, Vec<f32>)>, segs: &[(u64, u64)]
                             }
                         }
                     }
-                    if tx.send((pos, v)).is_err() {
+                    if let Some(l) = limiter.as_mut() {
+                        v = l.process(&v[..got * ch]);
+                    }
+                    if !v.is_empty() && tx.send((pos, v)).is_err() {
                         return;
                     }
                     pos += got as u64;
+                    last_pos = pos;
                 }
+            }
+        }
+    }
+    if let Some(l) = limiter.as_mut() {
+        if !stop.load(Ordering::Relaxed) {
+            let rest = l.flush();
+            if !rest.is_empty() {
+                let _ = tx.send((last_pos.saturating_sub((rest.len() / ch) as u64), rest));
             }
         }
     }

@@ -141,6 +141,8 @@ Ze worden per pc opgeslagen in `%APPDATA%\StudioRecorder\settings.json`, dus elk
 ## Techniek
 
 - Rust, met egui (interface), cpal (WASAPI-audio), flacenc (FLAC), LAME (MP3) en ureq + Windows-TLS (AudioShare).
+- Dezelfde broncode bouwt ook de **ArchiefRecorder** (`src/bin/archiefrecorder.rs`, zie `LEESMIJ-ArchiefRecorder.md`).
+  De StudioRecorder werkt ongewijzigd: export, MP3 320k (stand *Best*), AudioShare en instellingen zijn gelijk aan 0.8.0.
 - `src/engine.rs`: invoer, meters en crashveilig wegschrijven · `src/wav.rs`: WAV/RF64 lezen en schrijven ·
   `src/export.rs`: trimmen naar FLAC/WAV · `src/player.rs`: afspelen · `src/app.rs`: interface.
 - Bouwen op Windows: installeer Rust (rustup.rs) en voer `cargo build --release` uit in deze map.

@@ -1,0 +1,26 @@
+1 ICON "archief.ico"
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "041304B0"
+    BEGIN
+      VALUE "FileDescription", "ArchiefRecorder"
+      VALUE "ProductName", "ArchiefRecorder"
+      VALUE "FileVersion", "1.0.0"
+      VALUE "ProductVersion", "1.0.0"
+      VALUE "OriginalFilename", "ArchiefRecorder.exe"
+      VALUE "CompanyName", "JohnWorks"
+      VALUE "LegalCopyright", "JohnWorks"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0413, 1200
+  END
+END

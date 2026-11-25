@@ -42,6 +42,21 @@ pub struct ExportJob<'a> {
     pub crossfade_ms: u32,
     /// Vorbis comments for FLAC, e.g. ("TITLE", "..").
     pub tags: Vec<(String, String)>,
+    /// MP3 bitrate, mono output, leveler/limiter (defaults = StudioRecorder behaviour).
+    pub opts: ExportOptions,
+}
+
+/// Extra export options. The defaults give exactly the StudioRecorder behaviour.
+#[derive(Clone, Default)]
+pub struct ExportOptions {
+    /// MP3 bitrate in kbps (0 = 320).
+    pub mp3_kbps: u32,
+    /// LAME quality 0 (slowest, "Best") ..= 9; `None` = Best (as before).
+    pub mp3_quality: Option<u8>,
+    /// Mix stereo down to mono.
+    pub mono: bool,
+    /// Volume leveling and/or peak limiting.
+    pub level: Option<std::sync::Arc<crate::level::LevelPlan>>,
 }
 
 const BLOCK: usize = 4096;
@@ -80,20 +95,62 @@ pub fn export(job: &ExportJob, progress: &AtomicU32, cancel: &AtomicBool) -> Res
     // Write to a temporary name first so a half-written export never looks finished.
     let tmp = job.dst.with_extension(format!("{}.part", job.format.ext()));
     let res = (|| -> Result<(), String> {
+        let mono = job.opts.mono && ch == 2;
+        let out_ch = if mono { 1 } else { ch };
         let mut sink: Box<dyn Sink> = match job.format {
-            ExportFormat::Wav => Box::new(WavSink::new(&tmp, rate, ch, bits)?),
-            ExportFormat::Flac => Box::new(FlacSink::new(&tmp, rate, ch, bits, &job.tags)?),
-            ExportFormat::Mp3 => Box::new(Mp3Sink::new(&tmp, rate, ch, bits, &job.tags)?),
+            ExportFormat::Wav => Box::new(WavSink::new(&tmp, rate, out_ch, bits)?),
+            ExportFormat::Flac => Box::new(FlacSink::new(&tmp, rate, out_ch, bits, &job.tags)?),
+            ExportFormat::Mp3 => Box::new(Mp3Sink::new(&tmp, rate, out_ch, bits, &job.tags, &job.opts)?),
         };
+        let full = (1i64 << (bits - 1)) as f32;
+        let plan = job.opts.level.clone();
+        let mut limiter = plan.as_ref().and_then(|p| p.limiter.map(|l| crate::level::Limiter::new(rate, ch, &l)));
+        let gain = plan.as_ref().and_then(|p| p.curve.clone());
         let mut written = 0u64;
-        stream_segments(&mut r, &segs, xf, ch, cancel, &mut |block: &mut Vec<i32>| {
-            apply_fade(block, ch, written, total, fade);
-            written += (block.len() / ch) as u64;
-            progress.store((written * 999 / total.max(1)) as u32, Ordering::Relaxed);
-            sink.write(block)
+        let mut fbuf: Vec<f32> = Vec::new();
+        let mut mono_buf: Vec<i32> = Vec::new();
+        // Fade, mono and write one block of finished output frames.
+        let mut finish_block = |block: &mut Vec<i32>, written: &mut u64| -> Result<(), String> {
+            apply_fade(block, ch, *written, total, fade);
+            *written += (block.len() / ch) as u64;
+            progress.store((*written * 999 / total.max(1)) as u32, Ordering::Relaxed);
+            if mono {
+                mono_buf.clear();
+                mono_buf.extend(block.chunks_exact(2).map(|f| ((f[0] as i64 + f[1] as i64) / 2) as i32));
+                sink.write(&mono_buf)
+            } else {
+                sink.write(block)
+            }
+        };
+        let gain_fn = gain.as_ref().map(|g| move |pos: u64, buf: &mut [i32], ch: usize| g.apply_i32(pos, buf, ch));
+        let gain_ref: Option<&dyn Fn(u64, &mut [i32], usize)> = gain_fn.as_ref().map(|f| f as &dyn Fn(u64, &mut [i32], usize));
+        stream_segments(&mut r, &segs, xf, ch, cancel, gain_ref, &mut |block: &mut Vec<i32>| {
+            if let Some(lim) = limiter.as_mut() {
+                fbuf.clear();
+                fbuf.extend(block.iter().map(|&x| x as f32 / full));
+                let out = lim.process(&fbuf);
+                block.clear();
+                block.extend(out.iter().map(|&x| quantize(x, full)));
+                if block.is_empty() {
+                    return Ok(());
+                }
+            } else if gain_ref.is_some() {
+                // Leveled without limiter: never wrap around, clip at full scale.
+                let m = full as i32 - 1;
+                for x in block.iter_mut() {
+                    *x = (*x).clamp(-m - 1, m);
+                }
+            }
+            finish_block(block, &mut written)
         })?;
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        if let Some(lim) = limiter.as_mut() {
+            let mut rest: Vec<i32> = lim.flush().iter().map(|&x| quantize(x, full)).collect();
+            if !rest.is_empty() {
+                finish_block(&mut rest, &mut written)?;
+            }
         }
         sink.finish()
     })();
@@ -123,8 +180,17 @@ fn stream_segments(
     xf: u64,
     ch: usize,
     cancel: &AtomicBool,
+    gain: Option<&dyn Fn(u64, &mut [i32], usize)>,
     emit: &mut dyn FnMut(&mut Vec<i32>) -> Result<(), String>,
 ) -> Result<(), String> {
+    // Leveler: gain per source frame, applied right after reading (before crossfades).
+    let mut read = |r: &mut WavReader, start: u64, n: usize, out: &mut Vec<i32>| -> Result<usize, String> {
+        let got = r.read_i32(start, n, out).map_err(|e| e.to_string())?;
+        if let Some(g) = gain {
+            g(start, &mut out[..got * ch], ch);
+        }
+        Ok(got)
+    };
     let joins = join_lengths(segs, xf);
     let mut tail: Vec<i32> = Vec::new();
     let mut buf = Vec::new();
@@ -133,7 +199,7 @@ fn stream_segments(
         if k > 0 {
             let n = joins[k - 1] as usize;
             if n > 0 {
-                r.read_i32(a, n, &mut buf).map_err(|e| e.to_string())?;
+                read(r, a, n, &mut buf)?;
                 let mut mixed = Vec::with_capacity(n * ch);
                 for i in 0..n {
                     let t = (i as f64 + 0.5) / n as f64;
@@ -152,7 +218,7 @@ fn stream_segments(
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            let n = r.read_i32(pos, ((body_end - pos) as usize).min(65536), &mut buf).map_err(|e| e.to_string())?;
+            let n = read(r, pos, ((body_end - pos) as usize).min(65536), &mut buf)?;
             if n == 0 {
                 return Err("Onverwacht einde van het bronbestand".into());
             }
@@ -161,10 +227,16 @@ fn stream_segments(
         }
         tail.clear();
         if hold > 0 {
-            r.read_i32(body_end, hold as usize, &mut tail).map_err(|e| e.to_string())?;
+            read(r, body_end, hold as usize, &mut tail)?;
         }
     }
     Ok(())
+}
+
+/// Back from normalised float to the integer sample range (clipped).
+fn quantize(x: f32, full: f32) -> i32 {
+    let v = (x * full).round();
+    v.clamp(-full, full - 1.0) as i32
 }
 
 /// Apply linear fades to a block starting at output frame `pos`.
@@ -225,14 +297,31 @@ struct Mp3Sink {
 }
 
 impl Mp3Sink {
-    fn new(dst: &Path, rate: u32, ch: usize, bits: u16, tags: &[(String, String)]) -> Result<Self, String> {
+    fn new(dst: &Path, rate: u32, ch: usize, bits: u16, tags: &[(String, String)], opts: &ExportOptions) -> Result<Self, String> {
         use mp3lame_encoder::{Bitrate, Builder, Id3Tag, Quality};
         let e = |x: &dyn std::fmt::Debug| format!("MP3-encoder: {x:?}");
         let mut b = Builder::new().ok_or("MP3-encoder kon niet starten")?;
         b.set_num_channels(ch.min(2) as u8).map_err(|x| e(&x))?;
         b.set_sample_rate(rate).map_err(|x| e(&x))?;
-        b.set_brate(Bitrate::Kbps320).map_err(|x| e(&x))?;
-        b.set_quality(Quality::Best).map_err(|x| e(&x))?;
+        let brate = match opts.mp3_kbps {
+            0 | 320 => Bitrate::Kbps320,
+            256 => Bitrate::Kbps256,
+            224 => Bitrate::Kbps224,
+            192 => Bitrate::Kbps192,
+            160 => Bitrate::Kbps160,
+            128 => Bitrate::Kbps128,
+            k => return Err(format!("MP3-bitrate {k} kbps wordt niet ondersteund")),
+        };
+        b.set_brate(brate).map_err(|x| e(&x))?;
+        let q = match opts.mp3_quality.unwrap_or(0) {
+            0 => Quality::Best,
+            1 => Quality::SecondBest,
+            2 => Quality::NearBest,
+            3 => Quality::VeryNice,
+            4 => Quality::Nice,
+            _ => Quality::Good,
+        };
+        b.set_quality(q).map_err(|x| e(&x))?;
         let tag = |k: &str| latin1(tags.iter().find(|(t, _)| t == k).map(|(_, v)| v.as_str()).unwrap_or(""));
         let (title, artist, album, year, comment) = (tag("TITLE"), tag("ARTIST"), tag("ALBUM"), tag("DATE"), tag("DESCRIPTION"));
         let year: Vec<u8> = year.into_iter().take(4).collect();
@@ -286,7 +375,7 @@ impl Sink for Mp3Sink {
 }
 
 fn vorbis_comment(tags: &[(String, String)]) -> Vec<u8> {
-    let vendor = format!("StudioRecorder {}", env!("CARGO_PKG_VERSION"));
+    let vendor = format!("{} {}", crate::edition::app_name(), crate::edition::version());
     let mut v = Vec::new();
     v.extend_from_slice(&(vendor.len() as u32).to_le_bytes());
     v.extend_from_slice(vendor.as_bytes());
@@ -476,6 +565,7 @@ mod tests {
             fade_ms: 0,
             crossfade_ms: 10,
             tags: vec![("TITLE".into(), "Test uitzending".into()), ("DATE".into(), "2026-10-11".into())],
+            opts: ExportOptions::default(),
         };
         let prog = AtomicU32::new(0);
         export(&job, &prog, &AtomicBool::new(false)).unwrap();
@@ -510,6 +600,7 @@ mod tests {
             fade_ms: 0,
             crossfade_ms: 10,
             tags: vec![],
+            opts: ExportOptions::default(),
         };
         export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
         let mut out = WavReader::open(&dst).unwrap();
@@ -548,6 +639,7 @@ mod tests {
             fade_ms: 10,
             crossfade_ms: 10,
             tags: vec![],
+            opts: ExportOptions::default(),
         };
         export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
         let mut fr = claxon::FlacReader::open(&dst).unwrap();
@@ -567,6 +659,7 @@ mod tests {
             fade_ms: 10,
             crossfade_ms: 10,
             tags: vec![("TITLE".into(), "Café test".into()), ("ARTIST".into(), "De Blik".into())],
+            opts: ExportOptions::default(),
         };
         export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
         let size = std::fs::metadata(&dst).unwrap().len();
@@ -574,6 +667,137 @@ mod tests {
         assert!((380_000..450_000).contains(&size), "size {size}");
         let bytes = std::fs::read(&dst).unwrap();
         assert_eq!(&bytes[0..3], b"ID3");
+    }
+
+    /// Write a test "tape": 40 s soft music, 5 s hiss, 40 s loud music with peaks.
+    fn make_tape(name: &str) -> PathBuf {
+        let p = tmp(name);
+        let mut w = WavWriter::create(&p, 48_000, 2, 24).unwrap();
+        let mut v = Vec::new();
+        let mut seed = 3u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / 16_777_216.0 - 0.5
+        };
+        for i in 0..48_000 * 85usize {
+            let t = i as f32 / 48_000.0;
+            let music = (t * 2.0 * std::f32::consts::PI * 330.0).sin() * 0.6 + (t * 2.0 * std::f32::consts::PI * 880.0).sin() * 0.3;
+            let x = if t < 40.0 {
+                music * 0.03 + noise() * 0.002 // soft (about −34 LUFS)
+            } else if t < 45.0 {
+                noise() * 0.002 // hiss between the songs
+            } else {
+                // loud, with short peaks well over full scale after +gain
+                music * 0.5 * if (i / 12_000) % 9 == 4 { 1.8 } else { 1.0 } + noise() * 0.002
+            };
+            v.push(x);
+            v.push(x * 0.9);
+        }
+        w.write_f32(&v).unwrap();
+        w.finalize().unwrap();
+        p
+    }
+
+    #[test]
+    fn leveled_export_evens_out_and_never_clips() {
+        use crate::level::*;
+        let src = make_tape("tape.wav");
+        let mut r = WavReader::open(&src).unwrap();
+        let an = analyze(&mut r, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        let params = LevelParams::default();
+        let curve = std::sync::Arc::new(GainCurve::compute(&an, &params));
+        let lim = LimiterParams::default();
+        let dst = tmp("tape_out.wav");
+        let segs = vec![(48_000, 84 * 48_000)];
+        let job = ExportJob {
+            src: &src,
+            dst: &dst,
+            format: ExportFormat::Wav,
+            segments: segs.clone(),
+            fade_ms: 10,
+            crossfade_ms: 10,
+            tags: vec![],
+            opts: ExportOptions { level: Some(std::sync::Arc::new(LevelPlan { curve: Some(curve), limiter: Some(lim) })), ..Default::default() },
+        };
+        export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        let mut out = WavReader::open(&dst).unwrap();
+        assert_eq!(out.frames, output_frames(&segs, 480), "length unchanged");
+        let mut all = Vec::new();
+        out.read_f32(0, out.frames as usize, &mut all).unwrap();
+        let peak = all.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        assert!(peak <= 10f32.powf(-1.0 / 20.0) + 1e-4, "peak {peak}");
+        // loudness of soft and loud part after leveling: both near the target
+        let part = |a: f32, b: f32| {
+            let mut an = Analyzer::new(48_000, 2);
+            an.push(&all[(a * 48_000.0) as usize * 2..(b * 48_000.0) as usize * 2]);
+            an.finish().integrated()
+        };
+        let (soft, loud) = (part(10.0, 30.0), part(55.0, 75.0));
+        // the same parts of the original (output starts 1 s into the source)
+        let mut orig = Vec::new();
+        WavReader::open(&src).unwrap().read_f32(0, 85 * 48_000, &mut orig).unwrap();
+        let before = |a: f32, b: f32| {
+            let mut an = Analyzer::new(48_000, 2);
+            an.push(&orig[((a + 1.0) * 48_000.0) as usize * 2..((b + 1.0) * 48_000.0) as usize * 2]);
+            an.finish().integrated()
+        };
+        let (soft0, loud0) = (before(10.0, 30.0), before(55.0, 75.0));
+        eprintln!("soft {soft0:.1} -> {soft:.1} LUFS, loud {loud0:.1} -> {loud:.1} LUFS");
+        assert!((soft - soft0 - 12.0).abs() < 1.0, "soft part lifted by the maximum of 12 dB: {soft0} -> {soft}");
+        assert!((loud - (-16.0)).abs() < 1.5, "loud part near the target: {loud}");
+        assert!((soft0 - loud0).abs() - (soft - loud).abs() > 10.0, "difference evened out");
+        // hiss between the songs is not lifted above the soft part's gain (+12 dB max)
+        let hiss = part(40.5, 43.5);
+        assert!(hiss < -50.0, "hiss stays down: {hiss}");
+    }
+
+    #[test]
+    fn mono_export_halves_channels() {
+        let src = make_src("src_mono.wav", 48_000, 2);
+        let dst = tmp("mono.wav");
+        let job = ExportJob {
+            src: &src,
+            dst: &dst,
+            format: ExportFormat::Wav,
+            segments: vec![(0, 48_000)],
+            fade_ms: 0,
+            crossfade_ms: 10,
+            tags: vec![],
+            opts: ExportOptions { mono: true, ..Default::default() },
+        };
+        export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+        let mut out = WavReader::open(&dst).unwrap();
+        assert_eq!(out.fmt.channels, 1);
+        assert_eq!(out.frames, 48_000);
+        let (mut o, mut s) = (Vec::new(), Vec::new());
+        out.read_i32(1000, 1, &mut o).unwrap();
+        WavReader::open(&src).unwrap().read_i32(1000, 1, &mut s).unwrap();
+        assert_eq!(o[0], ((s[0] as i64 + s[1] as i64) / 2) as i32);
+    }
+
+    /// cargo test --release bench_mp3 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_mp3() {
+        let secs = 180;
+        let src = make_src("bench_src.wav", 48_000 * secs, 2);
+        for (kbps, q) in [(320, 0u8), (320, 2), (192, 0), (192, 2), (192, 3)] {
+            let dst = tmp(&format!("bench_{kbps}_{q}.mp3"));
+            let job = ExportJob {
+                src: &src,
+                dst: &dst,
+                format: ExportFormat::Mp3,
+                segments: vec![(0, 48_000 * secs as u64)],
+                fade_ms: 0,
+                crossfade_ms: 10,
+                tags: vec![],
+                opts: ExportOptions { mp3_kbps: kbps, mp3_quality: Some(q), ..Default::default() },
+            };
+            let t = std::time::Instant::now();
+            export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+            let el = t.elapsed().as_secs_f64();
+            eprintln!("MP3 {kbps}k q{q}: {el:.2} s voor {secs} s audio = {:.0}x realtime, {} kB", secs as f64 / el, std::fs::metadata(&dst).unwrap().len() / 1000);
+        }
     }
 
     #[test]
@@ -588,6 +812,7 @@ mod tests {
             fade_ms: 10,
             crossfade_ms: 10,
             tags: vec![],
+            opts: ExportOptions::default(),
         };
         export(&job, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
         let mut r = WavReader::open(&dst).unwrap();

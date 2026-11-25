@@ -27,6 +27,24 @@ pub fn safe_file_part(s: &str) -> String {
 }
 
 impl Meta {
+    /// Empty programme information: StudioRecorder starts with today as
+    /// broadcast date, ArchiefRecorder with no date.
+    pub fn fresh() -> Meta {
+        Meta { date: if crate::edition::archive() { String::new() } else { Self::today() }, ..Default::default() }
+    }
+
+    /// ArchiefRecorder export name: "Artiest - Titel".
+    pub fn archive_name(&self) -> Option<String> {
+        let (a, t) = (self.program.trim(), self.title.trim());
+        let n = match (a.is_empty(), t.is_empty()) {
+            (true, true) => return None,
+            (false, true) => a.to_string(),
+            (true, false) => t.to_string(),
+            (false, false) => format!("{a} - {t}"),
+        };
+        Some(safe_file_part(&n))
+    }
+
     pub fn today() -> String {
         chrono::Local::now().format("%Y-%m-%d").to_string()
     }
@@ -86,7 +104,8 @@ impl Meta {
         add("ARTIST", &self.program);
         add("DATE", &self.date);
         add("DESCRIPTION", &self.description);
-        add("COMMENT", if self.description.trim().is_empty() { "Opgenomen met StudioRecorder" } else { &self.description });
+        let made = format!("Opgenomen met {}", crate::edition::app_name());
+        add("COMMENT", if self.description.trim().is_empty() { &made } else { &self.description });
         if studio.trim() != "Opname" {
             add("ORGANIZATION", studio);
         }

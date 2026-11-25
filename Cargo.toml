@@ -2,6 +2,7 @@
 name = "studiorecorder"
 version = "0.8.0"
 edition = "2024"
+default-run = "studiorecorder"
 rust-version = "1.91"
 build = "build.rs"
 
