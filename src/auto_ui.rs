@@ -158,6 +158,26 @@ pub fn window(
                         ui.label(RichText::new("Komt er geen STOP, dan stopt de opname zelf.").color(DIM));
                     });
                     ui.end_row();
+                    ui.label("Originele WAV's opruimen");
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .add(egui::DragValue::new(&mut s.cleanup_days).range(0..=365).custom_formatter(|v, _| {
+                                    if v < 0.5 { "nooit".into() } else { format!("na {v:.0} dagen") }
+                                }))
+                                .changed();
+                        });
+                        ui.label(
+                            RichText::new(
+                                "De recorder neemt eerst op als WAV in de opnamemap en slaat daarna op als FLAC/MP3. \
+                                 Die WAV blijft staan. Hier stel je in dat hij na zoveel dagen wordt verwijderd, \
+                                 alleen als opslaan/uploaden goed is gegaan. Handmatige opnames blijven altijd staan.",
+                            )
+                            .size(11.5)
+                            .color(DIM),
+                        );
+                    });
+                    ui.end_row();
                 });
                 ui.add_space(10.0);
 

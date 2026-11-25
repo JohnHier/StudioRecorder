@@ -138,6 +138,9 @@ pub struct AutoSettings {
     pub use_schedule: bool,
     pub use_fixed: bool,
     pub fixed: ProgRef,
+    /// Originele WAV's van goed verwerkte automatische opnames na zoveel dagen
+    /// verwijderen (0 = altijd bewaren).
+    pub cleanup_days: u32,
     pub schedule: Vec<Slot>,
     pub programs: HashMap<String, ProgAuto>,
 }
@@ -154,6 +157,7 @@ impl Default for AutoSettings {
             use_schedule: true,
             use_fixed: true,
             fixed: ProgRef::default(),
+            cleanup_days: 0,
             schedule: Vec::new(),
             programs: HashMap::new(),
         }
@@ -206,7 +210,9 @@ pub fn parse(text: &str) -> Result<(Command, Option<String>), String> {
         }
     }
     let Some(first) = words.first() else { return Err("leeg bericht".into()) };
+    // 'testprogramma' of "testprogramma" (StationPlaylist e.d.): aanhalingstekens weg.
     let rest = words[1..].join(" ");
+    let rest = rest.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '‘' | '’' | '“' | '”')).trim().to_string();
     let cmd = match first.to_ascii_uppercase().as_str() {
         "START" => Command::Start { program: (!rest.is_empty()).then_some(rest) },
         "STOP" => Command::Stop,
@@ -343,11 +349,70 @@ fn mmss(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
 }
 
+/// Originele WAV's van automatische opnames opruimen: alleen bestanden in de
+/// opnamemap zelf, met een `.json` ernaast waarin staat dat het een automatische
+/// opname is die goed is verwerkt, en die langer dan `days` dagen niet zijn
+/// gewijzigd. Handmatige opnames worden nooit aangeraakt.
+/// Geeft de verwijderde bestanden en het aantal vrijgekomen bytes terug.
+pub fn cleanup(folder: &Path, days: u32, now: std::time::SystemTime) -> (Vec<PathBuf>, u64) {
+    let mut removed = Vec::new();
+    let mut bytes = 0;
+    if days == 0 {
+        return (removed, bytes);
+    }
+    let age = Duration::from_secs(days as u64 * 86_400);
+    let Ok(rd) = std::fs::read_dir(folder) else { return (removed, bytes) };
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("wav")) {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() || md.modified().ok().and_then(|m| now.duration_since(m).ok()).is_none_or(|d| d < age) {
+            continue;
+        }
+        if !Meta::load(&p).is_some_and(|m| m.auto && m.processed) {
+            continue;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            let _ = std::fs::remove_file(Meta::sidecar(&p));
+            bytes += md.len();
+            removed.push(p);
+        }
+    }
+    (removed, bytes)
+}
+
 fn controller(ctx: Arc<Mutex<Ctx>>, status: Arc<Mutex<Status>>, stop_req: Arc<AtomicBool>, queue: Arc<Queue>, repaint: Box<dyn Fn() + Send>) {
     let mut sock: Option<(UdpSocket, u16, [u8; 4])> = None;
     let mut buf = [0u8; 1500];
+    // Opruimen: bij de start, elk uur, en meteen na het wijzigen van de instelling.
+    let mut last_cleanup: Option<(Instant, u32, String)> = None;
     loop {
         let c = ctx.lock().unwrap().clone();
+
+        let days = c.auto.cleanup_days;
+        let due = match &last_cleanup {
+            None => true,
+            Some((t, d, f)) => *d != days || *f != c.record_folder || t.elapsed() >= Duration::from_secs(3600),
+        };
+        if due && status.lock().unwrap().running.is_none() {
+            last_cleanup = Some((Instant::now(), days, c.record_folder.clone()));
+            let (gone, bytes) = cleanup(Path::new(&c.record_folder), days, std::time::SystemTime::now());
+            if !gone.is_empty() {
+                log(
+                    &queue,
+                    Level::Info,
+                    format!(
+                        "Opgeruimd: {} originele WAV-bestand{} ouder dan {days} dagen ({:.0} MB vrijgekomen)",
+                        gone.len(),
+                        if gone.len() == 1 { "" } else { "en" },
+                        bytes as f64 / 1_048_576.0
+                    ),
+                );
+                repaint();
+            }
+        }
 
         // Luisteren aan/uit, of opnieuw binden na een gewijzigde poort.
         let want = c.auto.enabled.then(|| (c.auto.port, c.auto.bind_addr()));
@@ -526,6 +591,8 @@ fn start(c: &Ctx, status: &Mutex<Status>, program: Option<&str>) -> Result<Strin
         title: title_from(&pa.title_pattern, &name, now),
         description: String::new(),
         speed: 0.0,
+        auto: true,
+        processed: false,
     };
     h.start_recording(&path).map_err(|e| format!("START_FAILED {e}"))?;
     meta.save(&path);
@@ -598,6 +665,8 @@ fn process(c: &Ctx, r: &Running, queue: &Queue) -> (String, bool) {
         title: title_from(&pa.title_pattern, &r.program_name, r.started),
         description: String::new(),
         speed: 0.0,
+        auto: true,
+        processed: false,
     });
     let studio = c.studio.as_ref();
     let as_prog = r.program.id.and_then(|id| studio.and_then(|s| s.programs.iter().find(|p| p.id == id)));
@@ -732,6 +801,12 @@ fn process(c: &Ctx, r: &Running, queue: &Queue) -> (String, bool) {
         }
     }
 
+    if errors.is_empty() {
+        // Pas nu mag het origineel later worden opgeruimd (zie `cleanup`).
+        meta.processed = true;
+        meta.save(&r.path);
+    }
+
     let mut parts = done;
     parts.extend(errors.iter().cloned());
     let msg = if parts.is_empty() { format!("{} — niets te doen", r.program_name) } else { format!("{} — {}", r.program_name, parts.join(" · ")) };
@@ -748,11 +823,43 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_only_processed_auto_recordings() {
+        let d = std::env::temp_dir().join("studiorec_cleanup_test");
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mk = |name: &str, meta: Option<Meta>| {
+            let p = d.join(name);
+            std::fs::write(&p, vec![0u8; 1000]).unwrap();
+            if let Some(m) = meta {
+                m.save(&p);
+            }
+            p
+        };
+        let done = mk("auto_klaar.wav", Some(Meta { auto: true, processed: true, ..Default::default() }));
+        let failed = mk("auto_fout.wav", Some(Meta { auto: true, processed: false, ..Default::default() }));
+        let manual = mk("handmatig.wav", Some(Meta { program: "X".into(), ..Default::default() }));
+        let bare = mk("zonder_json.wav", None);
+        let now = std::time::SystemTime::now();
+        // Nog niet oud genoeg, of opruimen uit: niets weg.
+        assert!(cleanup(&d, 14, now).0.is_empty());
+        assert!(cleanup(&d, 0, now + Duration::from_secs(400 * 86_400)).0.is_empty());
+        // 15 dagen later: alleen de goed verwerkte automatische opname.
+        let (gone, bytes) = cleanup(&d, 14, now + Duration::from_secs(15 * 86_400));
+        assert_eq!(gone, vec![done.clone()]);
+        assert_eq!(bytes, 1000);
+        assert!(!done.exists() && !Meta::sidecar(&done).exists());
+        assert!(failed.exists() && manual.exists() && bare.exists());
+    }
+
+    #[test]
     fn parse_commands() {
         assert_eq!(parse("START").unwrap(), (Command::Start { program: None }, None));
         assert_eq!(parse("  start \r\n").unwrap().0, Command::Start { program: None });
         assert_eq!(parse("START DeBlik1").unwrap().0, Command::Start { program: Some("DeBlik1".into()) });
         assert_eq!(parse("STOP key=geheim").unwrap(), (Command::Stop, Some("geheim".into())));
+        assert_eq!(parse("START 'testprogramma'").unwrap().0, Command::Start { program: Some("testprogramma".into()) });
+        assert_eq!(parse("START \"De Blik\"").unwrap().0, Command::Start { program: Some("De Blik".into()) });
+        assert_eq!(parse("START ''").unwrap().0, Command::Start { program: None });
         assert_eq!(parse("key=x START De Blik").unwrap(), (Command::Start { program: Some("De Blik".into()) }, Some("x".into())));
         assert_eq!(parse("status").unwrap().0, Command::Status);
         assert!(parse("").is_err());

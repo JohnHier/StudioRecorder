@@ -1,4 +1,4 @@
-# StudioRecorder 0.9.1
+# StudioRecorder 0.9.2
 
 Eenvoudige opname-app voor de radiostudio: opnemen met live waveform en VU-meter, daarna begin en eind trimmen, foutjes eruit knippen, exporteren naar FLAC, WAV of MP3 en aanleveren bij AudioShare.
 
@@ -54,7 +54,10 @@ Op elk knippunt komt bij het exporteren een crossfade van 10 ms, zodat er geen t
 - **Klik** in de golfvorm: afspeelpositie. **Slepen**: de afspeelpositie verschuiven (ook tijdens afspelen). **Scrollwiel**: in-/uitzoomen (tot op sample-niveau).
 - **Shift + scrollwiel**, rechtermuisknop slepen of klikken in de overzichtsbalk: verschuiven.
 
-**Exporteren** maakt een nieuw bestand (FLAC, WAV of MP3) van IN tot UIT, zonder de weggeknipte stukken, in dezelfde map.
+**Opslaan als** (heette tot 0.9.1 *Exporteren*) maakt een nieuw bestand (FLAC, WAV of MP3) van IN tot UIT, zonder de weggeknipte stukken.
+De opname zelf (het WAV-bestand dat je opende of opnam) blijft altijd ongewijzigd.
+Bij **Map** zie je waar het bestand komt: standaard de map van de opname. Met **Andere map…** kies je een vaste map; die onthoudt de recorder.
+**Terug naar de map van de opname** zet het weer op de standaard. Staat uploaden aan, dan heet de knop **Opslaan en uploaden**.
 MP3 wordt gemaakt in de hoogste MP3-kwaliteit: 320 kbps.
 Ben je ingelogd en staat **Na export uploaden naar AudioShare** aan, dan verschijnen daaronder programma, uitzenddag, titel en
 beschrijving (programma, uitzenddag en titel zijn dan verplicht) en wordt de bestandsnaam `<Programma> <uitzenddag> - <titel>`.
@@ -141,7 +144,7 @@ Komt er geen STOP, dan stopt de opname zelf na de **maximale opnameduur** (stand
 en een optionele sleutel. Met een sleutel moet elk bericht `key=<sleutel>` bevatten, bijv. `START key=geheim`.
 
 **Welk programma?** De recorder kijkt op volgorde (elk aan/uit te zetten):
-1. het bericht zelf: `START DeBlik1` (slug, naam of id uit AudioShare);
+1. het bericht zelf: `START DeBlik1` (slug, naam of id uit AudioShare). Aanhalingstekens eromheen worden genegeerd (vanaf 0.9.2): `START 'testprogramma'` werkt ook;
 2. het **weekrooster**: dagen, van–tot en programma. START mag 5 minuten vóór het begin; een blok over middernacht telt voor de dag waarop het begint;
 3. het **vaste programma**.
 Vindt hij niets, dan neemt hij niet op (`ERR UNKNOWN_PROGRAM`).
@@ -156,7 +159,9 @@ Vindt hij niets, dan neemt hij niet op (`ERR UNKNOWN_PROGRAM`).
 - Uitzenddatum = de dag van de opname. Titel volgens een patroon (standaard `{programma} — {datum}`, ook `{tijd}` en `{week}`).
   Omschrijving: die van de vorige aflevering uit AudioShare, of een vaste tekst. De bestandsnaam is de titel.
 - Staat er al een aflevering op die datum, dan wacht de upload op een bevestiging in het tabblad Uploads (er wordt niets automatisch vervangen).
-- Het originele 24-bit WAV-bestand blijft altijd in de opnamemap staan.
+- Het originele 24-bit WAV-bestand blijft in de opnamemap staan. Met **Originele WAV's opruimen** (vanaf 0.9.2, bij *Verbinding*) worden die na een ingesteld aantal dagen verwijderd,
+  alleen als opslaan/uploaden zonder fouten is gelukt. Handmatige opnames en automatische opnames van vóór 0.9.2 worden nooit verwijderd.
+  De recorder kijkt bij het starten en daarna elk uur; het logboek meldt hoeveel er is opgeruimd.
 
 Alles komt in het **logboek onderaan het venster Automatische opname** (vanaf 0.9.1, ook zonder AudioShare-koppeling), ook genegeerde berichten van niet-toegestane afzenders.
 De automatische modus werkt ook als het venster geminimaliseerd is. Een automatische opname kun je met de rode knop stoppen; hij wordt dan verwerkt zoals bij STOP.

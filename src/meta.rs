@@ -16,6 +16,10 @@ pub struct Meta {
     pub description: String,
     /// ArchiefRecorder: tape speed correction (factor, 0 or 1 = none).
     pub speed: f64,
+    /// Opgenomen door de automatische modus (UDP START/STOP).
+    pub auto: bool,
+    /// Automatische opname: opslaan/uploaden is zonder fouten gelukt.
+    pub processed: bool,
 }
 
 /// Characters Windows does not allow in file names are replaced.

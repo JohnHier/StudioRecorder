@@ -2092,7 +2092,14 @@ impl App {
         let fmt = self.settings.export_format;
         let name = ed.export_name.trim();
         let name = if name.is_empty() { "export" } else { name };
-        let dir = ed.origin.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = match self.settings.save_folder.trim() {
+            "" => ed.origin.parent().map(Path::to_path_buf).unwrap_or_default(),
+            d => PathBuf::from(d),
+        };
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.export_result = Some(Err(format!("De map {} is niet beschikbaar: {e}", dir.display())));
+            return;
+        }
         let mut dst = dir.join(format!("{name}.{}", fmt.ext()));
         let mut n = 2;
         while dst.exists() {
@@ -3465,7 +3472,7 @@ impl App {
         egui::Frame::NONE.fill(PANEL).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Exporteren").strong().color(TEXT));
+                ui.label(egui::RichText::new("Opslaan als").strong().color(TEXT));
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new("Bestandsnaam").color(DIM));
                 if ui.add_enabled(!exporting, egui::TextEdit::singleline(&mut ed.export_name).desired_width(380.0)).changed() {
@@ -3496,6 +3503,32 @@ impl App {
                 if changed {
                     self.settings.save();
                 }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Map").color(DIM));
+                let same = self.settings.save_folder.trim().is_empty();
+                let dir = if same {
+                    ed.origin.parent().map(|d| d.display().to_string()).unwrap_or_default()
+                } else {
+                    self.settings.save_folder.clone()
+                };
+                ui.label(egui::RichText::new(&dir).color(TEXT)).on_hover_text(&dir);
+                if same {
+                    ui.label(egui::RichText::new("(de map van de opname)").color(DIM));
+                }
+                ui.add_enabled_ui(!exporting, |ui| {
+                    if ui.button("Andere map…").clicked() {
+                        if let Some(d) = rfd::FileDialog::new().set_directory(&dir).pick_folder() {
+                            self.settings.save_folder = d.to_string_lossy().into_owned();
+                            self.settings.save();
+                        }
+                    }
+                    if !same && ui.small_button("Terug naar de map van de opname").clicked() {
+                        self.settings.save_folder.clear();
+                        self.settings.save();
+                    }
+                });
             });
             // AudioShare: only for a logged-in maker. Programme, date, title and
             // description only matter for the upload, so they're shown only then.
@@ -3609,7 +3642,15 @@ impl App {
                     if ibutton(ui, None, "Annuleren", true, None).clicked() {
                         x.cancel.store(true, Ordering::Relaxed);
                     }
-                } else if ibutton(ui, None, "Exporteren", true, Some(Color32::from_rgb(0x1f, 0x7a, 0x52))).clicked() {
+                } else if ibutton(
+                    ui,
+                    None,
+                    if !crate::edition::archive() && self.aus.active_profile().is_some() && self.settings.auto_upload { "Opslaan en uploaden" } else { "Opslaan" },
+                    true,
+                    Some(Color32::from_rgb(0x1f, 0x7a, 0x52)),
+                )
+                .clicked()
+                {
                     // handled below (needs &mut self)
                     ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("do_export"), true));
                 }
@@ -3621,7 +3662,8 @@ impl App {
                             1 => ", zonder het weggeknipte stuk".to_string(),
                             n => format!(", zonder de {n} weggeknipte stukken"),
                         };
-                        format!("Van IN tot UIT{cuts} ({}), naar dezelfde map als het origineel", fmt_time(kept, rate, false))
+                        let orig = ed.origin.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        format!("{} van IN tot UIT{cuts}. De opname zelf ({orig}) blijft ongewijzigd.", fmt_time(kept, rate, false))
                     })
                     .color(DIM),
                 );
@@ -3643,7 +3685,7 @@ impl App {
                     });
                 }
                 Some(Err(e)) => {
-                    ui.label(egui::RichText::new(format!("Export mislukt: {e}")).color(RED));
+                    ui.label(egui::RichText::new(format!("Opslaan mislukt: {e}")).color(RED));
                 }
                 None => {}
             }

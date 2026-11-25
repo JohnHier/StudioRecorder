@@ -13,6 +13,8 @@ pub struct Settings {
     /// cpal device id for playback ("" = system default)
     pub output_id: String,
     pub record_folder: String,
+    /// "Opslaan als" in Bewerken: deze map ("" = dezelfde map als de opname).
+    pub save_folder: String,
     /// Name used at the start of file names and in FLAC tags, e.g. "Studio 2".
     pub studio_name: String,
     pub export_format: ExportFormat,
@@ -53,6 +55,7 @@ impl Default for Settings {
             input_id: String::new(),
             output_id: String::new(),
             record_folder: default_folder().to_string_lossy().into_owned(),
+            save_folder: String::new(),
             studio_name: String::new(),
             export_format: if crate::edition::archive() { ExportFormat::Mp3 } else { ExportFormat::Flac },
             fade_ms: 10,
