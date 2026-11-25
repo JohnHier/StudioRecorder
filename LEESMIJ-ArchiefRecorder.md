@@ -1,4 +1,4 @@
-# ArchiefRecorder 1.1.0
+# ArchiefRecorder 1.2.0
 
 Opname-app voor het digitaliseren van cassettes en banden: opnemen, knippen, het volume gelijktrekken en
 exporteren naar MP3, FLAC of WAV. Gebouwd op dezelfde basis als de StudioRecorder, maar zonder AudioShare.
@@ -46,8 +46,13 @@ AI-model dat gemaakt is voor spraak: het houdt de stem over en haalt bandruis, b
 | Sterkte | Wat |
 |---|---|
 | Licht | Ruis 12 dB zachter; klinkt het meest natuurlijk |
+| 15 dB | Tussenstand (nieuw in 1.2) |
+| 18 dB | Tussenstand (nieuw in 1.2) |
 | Middel | Ruis 24 dB zachter (standaard) |
 | Sterk | Ruis helemaal weg; kan wat "droog" klinken |
+
+Elke sterkte wordt één keer gemaakt en bewaard zolang de recorder open is; terugschakelen naar een eerder
+gebruikte sterkte gaat daardoor snel.
 
 - Na het aanzetten maakt de recorder op de achtergrond een opgeschoonde werkkopie (balk rechts). Op een gewone
   pc duurt een uur interview enkele minuten. Golfvorm, leveler, beluisteren en exporteren gebruiken daarna de schone versie.
@@ -55,6 +60,23 @@ AI-model dat gemaakt is voor spraak: het houdt de stem over en haalt bandruis, b
 - Eerst de ruis weg, dan de leveler: de leveler meet dus op de schone stem.
 - Bedoeld voor **spraak**. Op muziek kan het vreemd klinken; zet het daar uit.
 - Werkt met elke samplerate (intern 48 kHz); knippunten blijven precies op hun plek.
+
+## Bandsnelheid corrigeren (nieuw in 1.2)
+
+Voor banden die te langzaam of te snel zijn opgenomen. Bovenaan het paneel boven het exporteren: **Snelheid**.
+- Een band die **te langzaam is opgenomen** klinkt bij afspelen te hoog en te snel: kies een **min-waarde**,
+  bijvoorbeeld −4 %. Te laag en te traag: een plus-waarde.
+- Snelheid en toonhoogte veranderen samen, precies zoals bij een bandrecorder met een snelheidsregelaar.
+  Ernaast staat hoeveel halve tonen dat is.
+- Stel de waarde in met − en + (stappen van 0,1 %) of typ hem in, en klik **Toepassen**. De recorder maakt een
+  werkkopie met de nieuwe snelheid; IN, UIT en weggeknipte stukken schuiven mee. **Terug naar 0 %** maakt het ongedaan.
+- De snelheid wordt eerst toegepast, daarna de stemisolatie en de leveler (die werken dus op de stem met de
+  juiste toonhoogte).
+- De gekozen snelheid wordt onthouden bij de opname: open je hem later opnieuw, dan wordt hij weer toegepast.
+- Bereik: −20 % tot +25 %.
+
+Tip: zoek de juiste snelheid op het gehoor met een stem die je kent, of op een muziekfragment waarvan je de
+toonhoogte kent. Een cassettedeck dat te langzaam liep, zit meestal 2 tot 6 % ernaast.
 
 ## Volume gelijktrekken (leveler)
 
@@ -90,7 +112,7 @@ zodat niets boven het plafond komt en niets vervormt.
 
 - Zelfde broncode als de StudioRecorder: `src/main.rs` bouwt `StudioRecorder.exe`,
   `src/bin/archiefrecorder.rs` bouwt `ArchiefRecorder.exe`. `src/edition.rs` bepaalt welke het is.
-- `src/denoise.rs`: stemisolatie met DeepFilterNet3 (crate `deep-filter-rt`, model ingebouwd, pure Rust), met
+- `src/denoise.rs`: snelheidscorrectie (resampling met `rubato`) en stemisolatie met DeepFilterNet3 (crate `deep-filter-rt`, model ingebouwd, pure Rust), met
   omzetting naar en van 48 kHz (`rubato`); tests op uitlijning en ruisvermindering bij 48 kHz stereo en 44,1 kHz mono.
 - `src/level.rs`: luidheidsmeting (ITU-R BS.1770 / EBU R128), versterkingscurve en look-ahead peak limiter, met tests.
 - De leveler en piekbegrenzer worden toegepast in `src/export.rs` (exporteren) en `src/player.rs` (beluisteren).

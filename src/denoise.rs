@@ -22,14 +22,22 @@ const DF_RATE: u32 = 48_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Strength {
     Light,
+    /// 15 dB (between Licht and Middel)
+    Light15,
+    /// 18 dB (between Licht and Middel)
+    Light18,
     Medium,
     Strong,
 }
 
 impl Strength {
+    pub const ALL: [Strength; 5] = [Strength::Light, Strength::Light15, Strength::Light18, Strength::Medium, Strength::Strong];
+
     pub fn atten_db(self) -> f32 {
         match self {
             Strength::Light => 12.0,
+            Strength::Light15 => 15.0,
+            Strength::Light18 => 18.0,
             Strength::Medium => 24.0,
             Strength::Strong => 100.0, // no limit
         }
@@ -37,6 +45,8 @@ impl Strength {
     pub fn label(self) -> &'static str {
         match self {
             Strength::Light => "Licht",
+            Strength::Light15 => "15 dB",
+            Strength::Light18 => "18 dB",
             Strength::Medium => "Middel",
             Strength::Strong => "Sterk",
         }
@@ -44,6 +54,8 @@ impl Strength {
     pub fn hint(self) -> &'static str {
         match self {
             Strength::Light => "Ruis 12 dB zachter; klinkt het meest natuurlijk",
+            Strength::Light15 => "Ruis 15 dB zachter (tussen Licht en Middel)",
+            Strength::Light18 => "Ruis 18 dB zachter (tussen Licht en Middel)",
             Strength::Medium => "Ruis 24 dB zachter",
             Strength::Strong => "Ruis helemaal weg (zoals DaVinci Voice Isolation); kan wat 'droog' klinken",
         }
@@ -161,7 +173,7 @@ impl Stage for Df {
 /// Clean `src` into `dst` (WAV, 24-bit, same rate, channels and length).
 /// Returns the waveform overview of the result. `progress` receives permille.
 pub fn render(src: &Path, dst: &Path, strength: Strength, progress: &AtomicU32, cancel: &AtomicBool) -> Result<Peaks, String> {
-    let mut r = WavReader::open(src).map_err(|e| format!("Kan bestand niet openen: {e}"))?;
+    let r = WavReader::open(src).map_err(|e| format!("Kan bestand niet openen: {e}"))?;
     let (rate, ch, total) = (r.fmt.sample_rate, r.fmt.channels as usize, r.frames);
     if !(1..=2).contains(&ch) {
         return Err("Stemisolatie werkt met mono- en stereobestanden".into());
@@ -182,8 +194,23 @@ pub fn render(src: &Path, dst: &Path, strength: Strength, progress: &AtomicU32, 
         stages.push(Box::new(down));
         d
     };
-    let mut skip = (delay.round() as usize) * ch;
+    run_chain(r, stages, delay, total, dst, progress, cancel)
+}
 
+/// Run `src` through `stages` into `dst` (24-bit WAV, same rate and channels):
+/// drops the chain's `delay` at the start, flushes it with silence at the end
+/// and writes exactly `out_total` frames. Returns the waveform overview.
+fn run_chain(
+    mut r: WavReader,
+    mut stages: Vec<Box<dyn Stage>>,
+    delay: f64,
+    out_total: u64,
+    dst: &Path,
+    progress: &AtomicU32,
+    cancel: &AtomicBool,
+) -> Result<Peaks, String> {
+    let (rate, ch, total) = (r.fmt.sample_rate, r.fmt.channels as usize, r.frames);
+    let mut skip = (delay.round() as usize) * ch;
     if let Some(d) = dst.parent() {
         std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
     }
@@ -194,8 +221,9 @@ pub fn render(src: &Path, dst: &Path, strength: Strength, progress: &AtomicU32, 
     let mut pos = 0u64;
     let mut inbuf = Vec::new();
     let zeros = vec![0f32; 4800 * ch];
+    let mut idle = 0u32;
     let result = (|| -> Result<(), String> {
-        while written < total {
+        while written < out_total {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Geannuleerd".into());
             }
@@ -210,24 +238,28 @@ pub fn render(src: &Path, dst: &Path, strength: Strength, progress: &AtomicU32, 
                     &inbuf[..n * ch]
                 }
             } else {
+                idle += 1;
+                if idle > 10_000 {
+                    return Err("Verwerking loopt vast".into());
+                }
                 &zeros
             };
             let mut data = block.to_vec();
             for s in stages.iter_mut() {
-                let mut out = Vec::with_capacity(data.len() + 4096);
+                let mut out = Vec::with_capacity(data.len() * 2 + 4096);
                 s.push(&data, &mut out)?;
                 data = out;
             }
             let start = skip.min(data.len());
             skip -= start;
-            let room = ((total - written) as usize) * ch;
+            let room = ((out_total - written) as usize) * ch;
             let take = &data[start..data.len().min(start + room)];
             if !take.is_empty() {
                 w.write_f32(take).map_err(|e| e.to_string())?;
                 peaks.push(take);
                 written += (take.len() / ch) as u64;
             }
-            progress.store((written * 1000 / total.max(1)) as u32, Ordering::Relaxed);
+            progress.store((written * 1000 / out_total.max(1)) as u32, Ordering::Relaxed);
         }
         Ok(())
     })();
@@ -243,6 +275,58 @@ pub fn render(src: &Path, dst: &Path, strength: Strength, progress: &AtomicU32, 
             Err(e)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tape speed correction
+// ---------------------------------------------------------------------------
+
+/// Allowed range of the speed correction (factor).
+pub const SPEED_MIN: f64 = 0.80;
+pub const SPEED_MAX: f64 = 1.25;
+
+/// Pitch change of a speed factor, in semitones.
+pub fn semitones(speed: f64) -> f64 {
+    12.0 * speed.log2()
+}
+
+/// Where the speed-corrected copy of `src` goes.
+pub fn speed_path(src: &Path, speed: f64) -> PathBuf {
+    let p = iso_path(src, Strength::Light);
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let base = name.trim_end_matches("-stem-light.wav");
+    p.with_file_name(format!("{base}-speed-{}.wav", (speed * 10_000.0).round() as i64))
+}
+
+/// Change the playing speed of `src` like a tape machine does: speed and
+/// pitch together. `speed` < 1 = slower and lower (for a tape that was
+/// recorded too slowly and so plays back too fast and too high).
+pub fn render_speed(src: &Path, dst: &Path, speed: f64, progress: &AtomicU32, cancel: &AtomicBool) -> Result<Peaks, String> {
+    if !(SPEED_MIN..=SPEED_MAX).contains(&speed) {
+        return Err(format!("Snelheid {:+.1} % valt buiten het bereik", (speed - 1.0) * 100.0));
+    }
+    let r = WavReader::open(src).map_err(|e| format!("Kan bestand niet openen: {e}"))?;
+    let (rate, ch, total) = (r.fmt.sample_rate, r.fmt.channels as usize, r.frames);
+    // treat the recording as if it had been sampled at rate·speed, convert back to rate
+    let from = (rate as f64 * speed).round() as u32;
+    let rs = Resample::new(from, rate, ch)?;
+    let delay = rs.delay() as f64;
+    let out_total = (total as f64 * rate as f64 / from as f64).round() as u64;
+    run_chain(r, vec![Box::new(rs)], delay, out_total, dst, progress, cancel)
+}
+
+/// The speed-corrected copy, made earlier or now.
+pub fn speed_changed(src: &Path, speed: f64, progress: &AtomicU32, cancel: &AtomicBool) -> Result<(PathBuf, Peaks), String> {
+    let dst = speed_path(src, speed);
+    if dst.exists() {
+        if let Ok(mut rd) = WavReader::open(&dst) {
+            if let Ok(p) = Peaks::from_reader(&mut rd, progress, cancel) {
+                return Ok((dst, p));
+            }
+        }
+    }
+    let p = render_speed(src, &dst, speed, progress, cancel)?;
+    Ok((dst, p))
 }
 
 /// The cleaned copy, made earlier or now.
@@ -336,6 +420,54 @@ mod tests {
         };
         let best = (-48i64..=48).max_by(|&p, &q| corr(p).partial_cmp(&corr(q)).unwrap()).unwrap();
         assert!(best.abs() <= 2, "{rate} Hz: misaligned by {best} samples");
+    }
+
+    /// Frequency of the strongest tone (zero crossings) in a mono signal.
+    fn freq(v: &[f32], rate: f32) -> f32 {
+        let z = v.windows(2).filter(|w| w[0] <= 0.0 && w[1] > 0.0).count();
+        z as f32 / (v.len() as f32 / rate)
+    }
+
+    #[test]
+    fn speed_correction_changes_speed_and_pitch() {
+        for (rate, speed) in [(48_000u32, 0.95f64), (44_100, 1.04)] {
+            let src = tmp(&format!("speed_{rate}.wav"));
+            let mut w = WavWriter::create(&src, rate, 2, 24).unwrap();
+            let n = rate as usize * 10;
+            let mut v = Vec::with_capacity(n * 2);
+            for i in 0..n {
+                let t = i as f32 / rate as f32;
+                // 1 kHz tone, with a click at 5.000 s to check the timing
+                let x = 0.3 * (2.0 * std::f32::consts::PI * 1000.0 * t).sin() + if i == rate as usize * 5 { 0.6 } else { 0.0 };
+                v.push(x);
+                v.push(x);
+            }
+            w.write_f32(&v).unwrap();
+            w.finalize().unwrap();
+            let dst = tmp(&format!("speed_{rate}_out.wav"));
+            render_speed(&src, &dst, speed, &AtomicU32::new(0), &AtomicBool::new(false)).unwrap();
+            let mut r = WavReader::open(&dst).unwrap();
+            let expect = (n as f64 / speed).round() as u64;
+            assert!((r.frames as i64 - expect as i64).abs() <= 2, "length {} vs {expect}", r.frames);
+            let mut out = Vec::new();
+            r.read_f32(rate as u64, rate as usize * 2, &mut out).unwrap();
+            let mono: Vec<f32> = out.iter().step_by(2).copied().collect();
+            let f = freq(&mono, rate as f32);
+            assert!((f as f64 - 1000.0 * speed).abs() < 3.0, "{rate} Hz ×{speed}: tone {f} Hz");
+            // the click moves to 5 s / speed
+            let mut all = Vec::new();
+            r.read_f32(0, r.frames as usize, &mut all).unwrap();
+            let (mut best, mut at) = (0f32, 0usize);
+            for (i, f) in all.chunks_exact(2).enumerate() {
+                let d = (f[0] - 0.3 * (2.0 * std::f32::consts::PI * 1000.0 * speed as f32 * i as f32 / rate as f32).sin()).abs();
+                if d > best {
+                    best = d;
+                    at = i;
+                }
+            }
+            let want = 5.0 * rate as f64 / speed;
+            assert!((at as f64 - want).abs() < rate as f64 * 0.002, "click at {at}, expected {want}");
+        }
     }
 
     #[test]

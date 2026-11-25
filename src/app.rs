@@ -1028,11 +1028,26 @@ struct Editor {
     /// Listen to the original instead of the leveled sound (A/B).
     listen_original: bool,
     /// The audio without voice isolation (and its overview), to switch back.
+    /// With a speed correction this is the speed-corrected copy.
     raw_path: PathBuf,
     raw_peaks: Option<Peaks>,
+    /// The audio as recorded/opened (before speed correction) and its overview.
+    orig_path: PathBuf,
+    orig_peaks: Option<Peaks>,
+    /// Speed correction in use (factor) and the value being edited (percent).
+    speed: f64,
+    speed_pct: f64,
+    speed_job: Option<SpeedJob>,
     /// Voice isolation now in use, and the job making a cleaned copy.
     iso: Option<crate::denoise::Strength>,
     iso_job: Option<IsoJob>,
+}
+
+struct SpeedJob {
+    speed: f64,
+    progress: Arc<AtomicU32>,
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<Result<(PathBuf, Peaks), String>>,
 }
 
 struct IsoJob {
@@ -1049,6 +1064,11 @@ impl Editor {
             reader: WavReader::open(&path).ok(),
             raw_path: path.clone(),
             raw_peaks: None,
+            orig_path: path.clone(),
+            orig_peaks: None,
+            speed: 1.0,
+            speed_pct: 0.0,
+            speed_job: None,
             iso: None,
             iso_job: None,
             path,
@@ -1107,8 +1127,79 @@ impl Editor {
         self.start_analysis();
     }
 
+    /// Apply a tape speed correction (factor; 1 = none) in the background.
+    fn start_speed(&mut self, speed: f64) {
+        if let Some(j) = self.speed_job.take() {
+            j.cancel.store(true, Ordering::Relaxed);
+        }
+        if (speed - self.speed).abs() < 1e-6 {
+            return;
+        }
+        if let Some(j) = self.iso_job.take() {
+            j.cancel.store(true, Ordering::Relaxed);
+        }
+        let progress = Arc::new(AtomicU32::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let (src, pr, ca) = (self.orig_path.clone(), progress.clone(), cancel.clone());
+        let orig_peaks = self.orig_peaks.clone().unwrap_or_else(|| self.raw_peaks.clone().unwrap_or_else(|| self.peaks.clone()));
+        std::thread::spawn(move || {
+            let res = if (speed - 1.0).abs() < 1e-6 {
+                Ok((src, orig_peaks))
+            } else {
+                crate::denoise::speed_changed(&src, speed, &pr, &ca)
+            };
+            let _ = tx.send(res);
+        });
+        self.speed_job = Some(SpeedJob { speed, progress, cancel, rx });
+    }
+
+    /// Pick up a finished speed correction: new timeline, markers scaled along.
+    fn poll_speed(&mut self) -> Option<String> {
+        let res = self.speed_job.as_ref()?.rx.try_recv().ok()?;
+        let job = self.speed_job.take()?;
+        let (path, peaks) = match res {
+            Ok(x) => x,
+            Err(e) if e == "Geannuleerd" => return None,
+            Err(e) => return Some(e),
+        };
+        if self.orig_peaks.is_none() {
+            // overview of the original, to come back to 0 %
+            self.orig_peaks = Some(self.raw_peaks.clone().unwrap_or_else(|| self.peaks.clone()));
+        }
+        let old_frames = self.frames.max(1) as f64;
+        let new_frames = peaks.total_frames().max(1) as f64;
+        let k = new_frames / old_frames;
+        let sc = |f: u64| ((f as f64 * k).round() as u64).min(new_frames as u64);
+        self.in_pt = sc(self.in_pt);
+        self.out_pt = if self.out_pt as f64 >= old_frames { new_frames as u64 } else { sc(self.out_pt) };
+        self.playhead = sc(self.playhead);
+        self.cuts = self.cuts.iter().map(|&(a, b)| (sc(a), sc(b))).collect();
+        self.undo = self.undo.iter().map(|u| u.iter().map(|&(a, b)| (sc(a), sc(b))).collect()).collect();
+        self.sel = None;
+        self.sel_cut = None;
+        self.view_start *= k;
+        self.view_len = (self.view_len * k).max(1.0);
+        self.frames = new_frames as u64;
+        // isolation (if on) is redone on the new timeline
+        if let Some(j) = self.iso_job.take() {
+            j.cancel.store(true, Ordering::Relaxed);
+        }
+        self.iso = None;
+        self.raw_peaks = None;
+        self.raw_path = path.clone();
+        self.set_audio(path, peaks);
+        self.speed = job.speed;
+        self.meta.speed = if (job.speed - 1.0).abs() < 1e-6 { 0.0 } else { job.speed };
+        self.meta.save(&self.origin);
+        None
+    }
+
     /// Keep voice isolation in step with the settings: start a job, or switch back.
     fn update_isolation(&mut self, on: bool, strength: crate::denoise::Strength) {
+        if self.speed_job.is_some() {
+            return; // first the new speed, then isolation on top of it
+        }
         let want = on.then_some(strength);
         if self.iso == want {
             if let Some(j) = self.iso_job.take() {
@@ -1916,6 +2007,10 @@ impl App {
             self.export_result = Some(Err(format!("Vul voor het uploaden eerst in: {} (of zet uploaden uit)", missing.join(", "))));
             return;
         }
+        if crate::edition::archive() && ed.speed_job.is_some() {
+            self.export_result = Some(Err("De snelheidscorrectie is nog bezig — even wachten".into()));
+            return;
+        }
         if crate::edition::archive() && ed.iso_job.is_some() {
             self.export_result = Some(Err("De stemisolatie is nog bezig — even wachten".into()));
             return;
@@ -2012,6 +2107,10 @@ impl App {
                             let mut ed = Editor::new(work, path, fmt, frames, peaks, meta);
                             if crate::edition::archive() {
                                 ed.start_analysis();
+                                if ed.meta.speed > 0.0 && (ed.meta.speed - 1.0).abs() > 1e-6 {
+                                    ed.speed_pct = (ed.meta.speed - 1.0) * 100.0;
+                                    ed.start_speed(ed.meta.speed);
+                                }
                                 if let Some(n) = ed.meta.archive_name() {
                                     ed.export_name = n;
                                 }
@@ -2056,6 +2155,9 @@ impl App {
             let (iso_on, iso_st) = (self.settings.isolate_on, self.settings.isolate);
             let mut errs = Vec::new();
             if let Some(ed) = self.editor.as_mut() {
+                if let Some(e) = ed.poll_speed() {
+                    errs.push(format!("Snelheid: {e}"));
+                }
                 ed.update_isolation(iso_on, iso_st);
                 if let Some(e) = ed.poll_isolation() {
                     errs.push(format!("Stemisolatie: {e}"));
@@ -2557,7 +2659,7 @@ impl App {
         // Main waveform
         let avail = ui.available_size();
         // room below the waveform for the controls (ArchiefRecorder: also the volume panel)
-        let reserve = if crate::edition::archive() { if self.settings.level_on || self.settings.limiter_on { 575.0 } else { 535.0 } } else { 500.0 };
+        let reserve = if crate::edition::archive() { if self.settings.level_on || self.settings.limiter_on { 605.0 } else { 565.0 } } else { 500.0 };
         let wave_h = (avail.y - reserve).clamp(100.0, 520.0);
         let (outer, resp) = ui.allocate_exact_size(vec2(avail.x, wave_h), Sense::click_and_drag());
         let p = ui.painter_at(outer);
@@ -3092,15 +3194,59 @@ impl App {
             egui::Frame::NONE.fill(PANEL).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Snelheid").strong().color(TEXT));
+                    ui.add_space(4.0);
+                    let busy = ed.speed_job.is_some();
+                    ui.add_enabled_ui(!busy, |ui| {
+                        if ui.small_button("−").on_hover_text("0,1 % langzamer").clicked() {
+                            ed.speed_pct = (ed.speed_pct - 0.1).max(-20.0);
+                        }
+                        ui.add(
+                            egui::DragValue::new(&mut ed.speed_pct)
+                                .range(-20.0..=25.0)
+                                .speed(0.05)
+                                .fixed_decimals(1)
+                                .suffix(" %"),
+                        )
+                        .on_hover_text("Speelt de band sneller of langzamer af, toonhoogte en tempo samen (zoals een bandrecorder). Klinkt de stem te hoog en te snel (te langzaam opgenomen)? Kies een min-waarde, bijv. −4 %.");
+                        if ui.small_button("+").on_hover_text("0,1 % sneller").clicked() {
+                            ed.speed_pct = (ed.speed_pct + 0.1).min(25.0);
+                        }
+                        let target = 1.0 + (ed.speed_pct * 10.0).round() / 1000.0;
+                        let st = crate::denoise::semitones(target);
+                        ui.label(egui::RichText::new(format!("{st:+.2} halve toon")).color(DIM));
+                        let pending = (target - ed.speed).abs() > 1e-6;
+                        if ui.add_enabled(pending, egui::Button::new("Toepassen")).on_hover_text("Maakt een werkkopie met de nieuwe snelheid; IN, UIT en knippen schuiven mee").clicked() {
+                            ed.start_speed(target);
+                            stop_req = true;
+                        }
+                        if (ed.speed - 1.0).abs() > 1e-6 && ui.small_button("Terug naar 0 %").clicked() {
+                            ed.speed_pct = 0.0;
+                            ed.start_speed(1.0);
+                            stop_req = true;
+                        }
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if let Some(j) = &ed.speed_job {
+                            let v = j.progress.load(Ordering::Relaxed) as f32 / 1000.0;
+                            ui.add(egui::ProgressBar::new(v).desired_width(140.0).show_percentage());
+                            ui.label(egui::RichText::new("Snelheid aanpassen").color(DIM));
+                        } else if (ed.speed - 1.0).abs() > 1e-6 {
+                            ui.label(egui::RichText::new(format!("Snelheid {:+.1} % actief", (ed.speed - 1.0) * 100.0)).color(GREEN));
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("Ruis").strong().color(TEXT));
-                    ui.add_space(22.0);
+                    ui.add_space(30.0);
                     changed |= ui
                         .checkbox(&mut self.settings.isolate_on, "Ruis verwijderen (AI-stemisolatie)")
                         .on_hover_text("DeepFilterNet3: houdt de stem over en haalt bandruis, brom en geknister weg. Bedoeld voor spraak (interviews); muziek kan er vreemd van gaan klinken.")
                         .changed();
                     ui.add_space(8.0);
                     ui.add_enabled_ui(self.settings.isolate_on, |ui| {
-                        for st in [crate::denoise::Strength::Light, crate::denoise::Strength::Medium, crate::denoise::Strength::Strong] {
+                        for st in crate::denoise::Strength::ALL {
                             changed |= ui.selectable_value(&mut self.settings.isolate, st, st.label()).on_hover_text(st.hint()).changed();
                         }
                     });
@@ -3110,7 +3256,7 @@ impl App {
                             ui.add(egui::ProgressBar::new(v).desired_width(140.0).show_percentage());
                             ui.label(egui::RichText::new("Stem isoleren").color(DIM));
                         } else if let Some(st) = ed.iso {
-                            ui.label(egui::RichText::new(format!("Stemisolatie actief ({})", st.label().to_lowercase())).color(GREEN));
+                            ui.label(egui::RichText::new(format!("Stemisolatie actief ({})", st.label())).color(GREEN));
                         }
                     });
                 });
@@ -3795,7 +3941,7 @@ impl eframe::App for App {
         self.confirm_dialogs(ctx);
         self.draw_toast(ctx);
 
-        let analysing = self.editor.as_ref().is_some_and(|e| e.analyzing.is_some() || e.iso_job.is_some());
+        let analysing = self.editor.as_ref().is_some_and(|e| e.analyzing.is_some() || e.iso_job.is_some() || e.speed_job.is_some());
         let busy = self.engine.is_some() || self.player.is_playing() || self.loading.is_some() || self.exporting.is_some() || analysing;
         if busy {
             ctx.request_repaint_after(Duration::from_millis(30));

@@ -14,6 +14,8 @@ pub struct Meta {
     pub date: String,
     pub title: String,
     pub description: String,
+    /// ArchiefRecorder: tape speed correction (factor, 0 or 1 = none).
+    pub speed: f64,
 }
 
 /// Characters Windows does not allow in file names are replaced.
